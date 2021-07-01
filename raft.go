@@ -131,10 +131,10 @@ func (r *Raft) run() {
 	}
 }
 
-// followerAppendEntries is invoked when we are in the follower state and
-// get an append entries RPC call
-func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
-	// Setup a default response
+// appendEntries is invoked when we get an append entries RPC call
+// Returns true if we transition to a Follower
+func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool) {
+	// Setup a response
 	resp := &AppendEntriesResponse{
 		Term:    r.currentTerm,
 		Success: false,
@@ -142,29 +142,32 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 	var err error
 	defer rpc.Respond(resp, err)
 
-	// Ignore any previous term
+	// Ignore an older term
 	if a.Term < r.currentTerm {
-		err = errors.New("obsolete entry")
+		err = errors.New("obsolete term")
 		return
 	}
 
-	// Increase the term if we see a newer one
-	if a.Term > r.currentTerm {
+	// Increase the term if we see a newer one, also transition to follower
+	// if we ever get an appendEntries call
+	if a.Term > r.currentTerm || r.state != Follower {
 		r.currentTerm = a.Term
 		resp.Term = a.Term
 
-		// TODO: Ensure transition to follower
+		// Ensure transition to follower
+		transition = true
+		r.state = Follower
 	}
 
 	// Verify the last log entry
 	var prevLog Log
 	if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
-		r.logW.Printf("failed to get previous log: %d %v",
+		r.logW.Printf("Failed to get previous log: %d %v",
 			a.PrevLogEntry, err)
 		return
 	}
 	if a.PrevLogTerm != prevLog.Term {
-		r.logW.Printf("previous log term mis-match: ours: %d remote: %d",
+		r.logW.Printf("Previous log term mis-match: ours: %d remote: %d",
 			prevLog.Term, a.PrevLogTerm)
 		return
 	}
@@ -173,20 +176,21 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 	for _, entry := range a.Entries {
 		// Delete any conflicting entries
 		if entry.Index <= r.lastLogIndex {
-			r.logW.Printf("clearing log suffix from %d to %d", entry.Index, r.lastLogIndex)
+			r.logW.Printf("Clearing log suffix from %d to %d",
+				entry.Index, r.lastLogIndex)
 			if err := r.logs.DeleteRange(entry.Index, r.lastLogIndex); err != nil {
-				r.logE.Printf("failed to clear log suffix: %v", err)
+				r.logE.Printf("Failed to clear log suffix: %v", err)
 				return
 			}
 		}
 
 		// Append the entry
 		if err := r.logs.StoreLog(entry); err != nil {
-			r.logE.Printf("failed to append to log: %v", err)
+			r.logE.Printf("Failed to append to log: %v", err)
 			return
 		}
 
-		// Update the lastLogIndex
+		// Update the lastLog
 		r.lastLogIndex = entry.Index
 	}
 
@@ -199,11 +203,12 @@ func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// Everything went well, set success
 	resp.Success = true
+	return
 }
 
-// followerRequestVote is invoked when we are in the follwer state and
+// requestVote is invoked when we are in the follwer state and
 // get an request vote RPC call
-func (r *Raft) followerRequestVote(rpc RPC, req *RequestVoteRequest) {
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// TODO
 }
 
@@ -216,11 +221,11 @@ func (r *Raft) runFollower() {
 			// Handle the command
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
-				r.followerAppendEntries(rpc, cmd)
+				r.appendEntries(rpc, cmd)
 			case *RequestVoteRequest:
-				r.followerRequestVote(rpc, cmd)
+				r.requestVote(rpc, cmd)
 			default:
-				log.Printf("[ERR] in follower state, got unexpected command: %#v", rpc.Command)
+				r.logE.Printf("In follower state, got unexpected command: %#v", rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 
@@ -244,7 +249,7 @@ func (r *Raft) runCandidate() {
 			// Handle the command
 			switch rpc.Command.(type) {
 			default:
-				log.Printf("[ERR] Candidate state, got unexpected command: %#v", rpc.Command)
+				r.logE.Printf("Candidate state, got unexpected command: %#v", rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 

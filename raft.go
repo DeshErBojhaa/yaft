@@ -1,9 +1,11 @@
 package yaft
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -19,6 +21,8 @@ const (
 	// the leader for some time, so it decides to step up.
 	Candidate
 
+	// Leader handles all write request. Leader is not expected
+	// to change very often.
 	Leader
 )
 
@@ -66,20 +70,40 @@ type Raft struct {
 	// term changes.
 	uncommittedSize uint64
 
+	// Transport layer. Most probably TCP.
 	trans Transport
+
+	// Cache the current term, write through to StableStore
+	currentTerm uint64
+
+	// Cache the latest log index, though we can get from LogStore
+	lastLogIndex uint64
+
+	// Log warnings
+	logW *log.Logger
+	// log errors
+	logE *log.Logger
 }
 
 // NewRaft is used to construct a new Raft node
 func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
+	lastLog, err := logs.LastIndex()
+	if err != nil {
+		return nil, fmt.Errorf("failed to find last log: %v", err)
+	}
+
 	r := &Raft{
-		conf:        conf,
-		state:       Follower,
-		stable:      store,
-		logs:        logs,
-		commitIndex: 0,
-		lastApplied: 0,
-		fsm:         fsm,
-		shutdownCh:  make(chan struct{}),
+		conf:         conf,
+		state:        Follower,
+		stable:       store,
+		logs:         logs,
+		commitIndex:  0,
+		lastApplied:  0,
+		fsm:          fsm,
+		shutdownCh:   make(chan struct{}),
+		lastLogIndex: lastLog,
+		logE: log.New(os.Stdout, "[ERROR]", log.LstdFlags),
+		logW: log.New(os.Stdout, "[WARN]", log.LstdFlags),
 	}
 
 	go r.run()
@@ -106,10 +130,75 @@ func (r *Raft) run() {
 		}
 	}
 }
-// followerAppendEntries is invoked when we are in the follwer state and
+
+// followerAppendEntries is invoked when we are in the follower state and
 // get an append entries RPC call
 func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
-	// TODO
+	// Setup a default response
+	resp := &AppendEntriesResponse{
+		Term:    r.currentTerm,
+		Success: false,
+	}
+	var err error
+	defer rpc.Respond(resp, err)
+
+	// Ignore any previous term
+	if a.Term < r.currentTerm {
+		err = errors.New("obsolete entry")
+		return
+	}
+
+	// Increase the term if we see a newer one
+	if a.Term > r.currentTerm {
+		r.currentTerm = a.Term
+		resp.Term = a.Term
+
+		// TODO: Ensure transition to follower
+	}
+
+	// Verify the last log entry
+	var prevLog Log
+	if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
+		r.logW.Printf("failed to get previous log: %d %v",
+			a.PrevLogEntry, err)
+		return
+	}
+	if a.PrevLogTerm != prevLog.Term {
+		r.logW.Printf("previous log term mis-match: ours: %d remote: %d",
+			prevLog.Term, a.PrevLogTerm)
+		return
+	}
+
+	// Add all the entries
+	for _, entry := range a.Entries {
+		// Delete any conflicting entries
+		if entry.Index <= r.lastLogIndex {
+			r.logW.Printf("clearing log suffix from %d to %d", entry.Index, r.lastLogIndex)
+			if err := r.logs.DeleteRange(entry.Index, r.lastLogIndex); err != nil {
+				r.logE.Printf("failed to clear log suffix: %v", err)
+				return
+			}
+		}
+
+		// Append the entry
+		if err := r.logs.StoreLog(entry); err != nil {
+			r.logE.Printf("failed to append to log: %v", err)
+			return
+		}
+
+		// Update the lastLogIndex
+		r.lastLogIndex = entry.Index
+	}
+
+	// Update the commit index
+	if a.LeaderCommitIndex > r.commitIndex {
+		r.commitIndex = min(a.LeaderCommitIndex, r.lastLogIndex)
+
+		// TODO: Trigger applying logs locally!
+	}
+
+	// Everything went well, set success
+	resp.Success = true
 }
 
 // followerRequestVote is invoked when we are in the follwer state and
@@ -196,4 +285,12 @@ func (r *Raft) Shutdown() {
 func randomTimeout(minVal, maxVal time.Duration) <-chan time.Time {
 	extra := time.Duration(rand.Int63()) % maxVal
 	return time.After((minVal + extra) % maxVal)
+}
+
+// min returns the minimum.
+func min(a, b uint64) uint64 {
+	if a <= b {
+		return a
+	}
+	return b
 }

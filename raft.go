@@ -33,6 +33,7 @@ var (
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
 	keyCandidateId  = []byte("CandidateId")
+	keyCurrentTerm  = []byte("CurrentTerm")
 
 	// ErrNotFound is used in persistence layer
 	ErrNotFound = errors.New("not found")
@@ -483,8 +484,12 @@ func (r *Raft) CandidateId() []byte {
 
 // setCurrentTerm is used to set the current term in a durable manner
 func (r *Raft) setCurrentTerm(t uint64) error {
+	// Make persistence
+	if err := r.stable.SetUint64(keyCurrentTerm, t); err != nil {
+		r.logE.Printf("Failed to save current term: %v", err)
+		return err
+	}
 	r.currentTerm = t
-	// TODO stable store
 	return nil
 }
 

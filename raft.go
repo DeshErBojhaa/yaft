@@ -64,7 +64,7 @@ type Raft struct {
 	// FSM is a finite state machine handler for logs
 	fsm FSM
 
-	// shutdownCh is to signal the systemwide shutdown
+	// shutdownCh is to signal the system wide shutdown
 	shutdownCh chan struct{}
 
 	// shutdownLock is mutex for shutdown operations
@@ -101,6 +101,11 @@ type Raft struct {
 
 	// peers ...
 	peers []net.Addr
+
+	// commitCh is used to provide the newest commit index
+	// so that changes can be applied to the FSM. This is used
+	// so the main goroutine can use commitIndex without locking.
+	commitCh chan uint64
 }
 
 // NewRaft is used to construct a new Raft node
@@ -130,6 +135,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
 		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
 		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
+		commitCh:    make(chan uint64, 128),
 	}
 
 	go r.run()
@@ -224,11 +230,11 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 	// Update the commit index
 	if a.LeaderCommitIndex > r.commitIndex {
 		r.commitIndex = min(a.LeaderCommitIndex, r.lastLogIndex)
-
-		// TODO: Trigger applying logs locally!
+		// Trigger applying logs locally
+		r.commitCh <- r.commitIndex
 	}
 
-	// Everything went well, set success
+	// Set success
 	resp.Success = true
 	return
 }
@@ -468,9 +474,21 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 
 // runLeader runs the FSM for a leader
 func (r *Raft) runLeader(ch <-chan RPC) {
-	<-ch // Shut up IDE!!
-	for {
+	transition := false
+	for !transition {
 		select {
+		case rpc := <-ch:
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				transition = r.appendEntries(rpc, cmd)
+			case *RequestVoteRequest:
+				transition = r.requestVote(rpc, cmd)
+			default:
+				r.logE.Printf("Leader state, got unexpected command: %#v",
+					rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
+
 		case <-r.shutdownCh:
 			return
 		}

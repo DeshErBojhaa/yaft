@@ -2,6 +2,7 @@ package yaft
 
 import (
 	"bytes"
+	cr "crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -31,6 +32,10 @@ const (
 var (
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
+	keyCandidateId  = []byte("CandidateId")
+
+	// ErrNotFound is used in persistence layer
+	ErrNotFound = errors.New("not found")
 )
 
 type Raft struct {
@@ -434,7 +439,7 @@ func (r *Raft) Shutdown() {
 
 // randomTimeout returns a value that is between the minVal and maxVal
 func randomTimeout(minVal, maxVal time.Duration) <-chan time.Time {
-	extra := time.Duration(rand.Int63()) % maxVal
+	extra := time.Duration(rand.Int()) % maxVal
 	return time.After((minVal + extra) % maxVal)
 }
 
@@ -459,8 +464,21 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 
 // CandidateId is used to return a stable and unique candidate ID
 func (r *Raft) CandidateId() []byte {
-	// TODO
-	return []byte("rand")
+	// Get the persistent id
+	raw, err := r.stable.Get(keyCandidateId)
+	if err == nil {
+		return raw
+	}
+
+	// Generate a UUID on the first call
+	if errors.Is(err, ErrNotFound) {
+		id := generateUUID()
+		if err := r.stable.Set(keyCandidateId, []byte(id)); err != nil {
+			panic(fmt.Errorf("failed to write CandidateId: %v", err))
+		}
+		return []byte(id)
+	}
+	panic(fmt.Errorf("failed to read CandidateId: %v", err))
 }
 
 // setCurrentTerm is used to set the current term in a durable manner
@@ -468,4 +486,19 @@ func (r *Raft) setCurrentTerm(t uint64) error {
 	r.currentTerm = t
 	// TODO stable store
 	return nil
+}
+
+// generateUUID is used to generate a random UUID
+func generateUUID() string {
+	buf := make([]byte, 16)
+	if _, err := cr.Read(buf); err != nil {
+		panic(fmt.Errorf("failed to read random bytes: %v", err))
+	}
+
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%12x",
+		buf[0:4],
+		buf[4:6],
+		buf[6:8],
+		buf[8:10],
+		buf[10:16])
 }

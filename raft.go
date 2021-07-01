@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -89,6 +90,9 @@ type Raft struct {
 	logW *log.Logger
 	// log errors
 	logE *log.Logger
+
+	// peers ...
+	peers []net.Addr
 }
 
 // NewRaft is used to construct a new Raft node
@@ -108,8 +112,8 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		fsm:          fsm,
 		shutdownCh:   make(chan struct{}),
 		lastLogIndex: lastLog,
-		logE: log.New(os.Stdout, "[ERROR]", log.LstdFlags),
-		logW: log.New(os.Stdout, "[WARN]", log.LstdFlags),
+		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
+		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
 	}
 
 	go r.run()
@@ -214,7 +218,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 
 // requestVote is called when node is in the follower state and
 // get an request vote for candidate.
-func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool){
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 	// Setup a response
 	resp := &RequestVoteResponse{
 		Term:    r.currentTerm,
@@ -223,17 +227,17 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool){
 	var err error
 	defer rpc.Respond(resp, err)
 
+	// Ignore an older term
+	if req.Term < r.currentTerm {
+		err = errors.New("obsolete term")
+		return
+	}
+
 	// Check if we have an existing leader
 	if leader := r.leader; leader != nil {
 		r.logW.Printf("raft: Rejecting vote from %v since we have a leader: %v",
 			req.Candidate, leader)
 		err = errors.New("already have a leader")
-		return
-	}
-
-	// Ignore an older term
-	if req.Term < r.currentTerm {
-		err = errors.New("obsolete term")
 		return
 	}
 
@@ -282,13 +286,76 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool){
 	}
 
 	// Persist a vote for safety
-	if err := r.persistVote(req.Term, string(req.Candidate)); err != nil {
+	if err := r.persistVote(req.Term, req.Candidate); err != nil {
 		r.logE.Printf("raft: Failed to persist vote: %v", err)
 		return
 	}
 
 	resp.Granted = true
 	return
+}
+
+// electSelf is used to send a RequestVote RPC to all peers,
+// and vote for itself. This has the side affecting of incrementing
+// the current term. The response channel returned is used to wait
+// for all the responses (including a vote for ourself).
+func (r *Raft) electSelf() <-chan *RequestVoteResponse {
+	// Create a response channel
+	respCh := make(chan *RequestVoteResponse, len(r.peers)+1)
+
+	// Get the last log
+	var lastLog Log
+	if r.lastLogIndex > 0 {
+		if err := r.logs.GetLog(r.lastLogIndex, &lastLog); err != nil {
+			r.logE.Printf("Failed to get last log: %d %v",
+				r.lastLogIndex, err)
+			return nil
+		}
+	}
+
+	// Increment the term
+	if err := r.setCurrentTerm(r.currentTerm + 1); err != nil {
+		r.logE.Printf("Failed to update current term: %v", err)
+		return nil
+	}
+
+	// Construct the request
+	req := &RequestVoteRequest{
+		Term:         r.currentTerm,
+		Candidate:    r.CandidateId(),
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
+	}
+
+	// request peer for a vote
+	reqPeer := func(peer net.Addr) {
+		resp := &RequestVoteResponse{
+			Granted: false,
+		}
+		err := r.trans.RequestVote(peer, req, resp)
+		if err != nil {
+			r.logE.Printf("Failed to make RequestVote RPC to %v: %v",
+				peer, err)
+			resp.Term = req.Term
+			resp.Granted = false
+		}
+		respCh <- resp
+	}
+
+	// For each peer, request a vote
+	for _, peer := range r.peers {
+		go reqPeer(peer)
+	}
+
+	// Persist a vote for ourselves
+	if err := r.persistVote(req.Term, req.Candidate); err != nil {
+		log.Printf("[ERR] Failed to persist vote : %v", err)
+		return nil
+	}
+
+	// Include our own vote
+	respCh <- &RequestVoteResponse{Term: req.Term, Granted: true}
+	return respCh
 }
 
 // runFollower runs the FSM for a follower
@@ -332,7 +399,7 @@ func (r *Raft) runCandidate() {
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 
-		case <-randomTimeout(r.conf.ElectionTimeout, r.conf.ElectionTimeout * 2):
+		case <-randomTimeout(r.conf.ElectionTimeout, r.conf.ElectionTimeout*2):
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
 			return
@@ -380,12 +447,25 @@ func min(a, b uint64) uint64 {
 }
 
 // persistVote is used to persist our vote for safety
-func (r *Raft) persistVote(term uint64, candidate string) error {
+func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
 		return err
 	}
-	if err := r.stable.Set(keyLastVoteCand, []byte(candidate)); err != nil {
+	if err := r.stable.Set(keyLastVoteCand, candidate); err != nil {
 		return err
 	}
+	return nil
+}
+
+// CandidateId is used to return a stable and unique candidate ID
+func (r *Raft) CandidateId() []byte {
+	// TODO
+	return []byte("rand")
+}
+
+// setCurrentTerm is used to set the current term in a durable manner
+func (r *Raft) setCurrentTerm(t uint64) error {
+	r.currentTerm = t
+	// TODO stable store
 	return nil
 }

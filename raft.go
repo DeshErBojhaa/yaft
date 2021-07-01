@@ -1,6 +1,10 @@
 package yaft
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 
 type RaftState uint8
 
@@ -141,4 +145,10 @@ func (r *Raft) Shutdown() {
 		close(r.shutdownCh)
 		r.shutdownCh = nil
 	}
+}
+
+// randomTimeout returns a value that is between the minVal and maxVal
+func randomTimeout(minVal, maxVal time.Duration) <-chan time.Time {
+	extra := time.Duration(rand.Int63()) % maxVal
+	return time.After((minVal + extra) % maxVal)
 }

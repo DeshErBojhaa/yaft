@@ -4,7 +4,7 @@ import "net"
 
 // RPC has a command, and provides a Reponse mechanism
 type RPC struct {
-	// Type assert to determien the type
+	// Type assert to determine the type
 	Command  interface{}
 	RespChan chan<- RPCResponse
 }
@@ -32,5 +32,7 @@ type Transport interface {
 
 	// RequestVote sends the appropriate RPC to the target node
 	RequestVote(target net.Addr, args *RequestVoteRequest, resp *RequestVoteResponse) error
+
+	//TODO: Snapshots?
 }
 

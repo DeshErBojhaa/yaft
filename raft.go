@@ -29,8 +29,8 @@ type Raft struct {
 	// Current state
 	state RaftState
 
-	// stable is a ConfigStore implementation for durable state
-	stable ConfigStore
+	// stable is a Store implementation for durable state
+	stable Store
 
 	// logs is a LogStore implementation to keep our logs
 	logs LogStore
@@ -70,7 +70,7 @@ type Raft struct {
 }
 
 // NewRaft is used to construct a new Raft node
-func NewRaft(conf *Config, store ConfigStore, logs LogStore, fsm FSM) (*Raft, error) {
+func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 	r := &Raft{
 		conf:        conf,
 		state:       Follower,
@@ -148,8 +148,22 @@ func (r *Raft) runFollower() {
 
 // runCandidate runs the FSM for a candidate
 func (r *Raft) runCandidate() {
+	ch := r.trans.Consume()
 	for {
 		select {
+		case rpc := <-ch:
+			// Handle the command
+			switch rpc.Command.(type) {
+			default:
+				log.Printf("[ERR] Candidate state, got unexpected command: %#v", rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
+
+		case <-randomTimeout(r.conf.ElectionTimeout, r.conf.ElectionTimeout * 2):
+			// Election failed! Restart the election. We simply return,
+			// which will kick us back into runCandidate
+			return
+
 		case <-r.shutdownCh:
 			return
 		}

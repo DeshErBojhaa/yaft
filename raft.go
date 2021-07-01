@@ -1,5 +1,7 @@
 package yaft
 
+import "sync"
+
 type RaftState uint8
 
 const (
@@ -13,9 +15,6 @@ const (
 
 	Leader
 )
-var _ = Follower
-var _ = Candidate
-var _ = Leader
 
 type Raft struct {
 	// Configuration
@@ -38,5 +37,108 @@ type Raft struct {
 
 	// If we are the leader, we have extra state
 	leader *LeaderState
+
+	// FSM is a finite state machine handler for logs
+	fsm FSM
+
+	// shutdownCh is to signal the systemwide shutdown
+	shutdownCh chan struct{}
+
+	// shutdownLock is mutex for shutdown operations
+	shutdownLock sync.Mutex
+
+	// Only one conf change may be pending (in the log, but not yet
+	// applied) at a time. This is enforced via pendingConfIndex, which
+	// is set to a value >= the log index of the latest pending
+	// configuration change (if any). Config changes are only allowed to
+	// be proposed if the leader's applied index is greater than this
+	// value.
+	pendingConfIndex uint64
+
+	// an estimate of the size of the uncommitted tail of the Raft log. Used to
+	// prevent unbounded log growth. Only maintained by the leader. Reset on
+	// term changes.
+	uncommittedSize uint64
+
+	// TODO: transport? TCP?
 }
 
+// NewRaft is used to construct a new Raft node
+func NewRaft(conf *Config, store ConfigStore, logs LogStore, fsm FSM) (*Raft, error) {
+	r := &Raft{
+		conf:        conf,
+		state:       Follower,
+		stable:      store,
+		logs:        logs,
+		commitIndex: 0,
+		lastApplied: 0,
+		fsm:         fsm,
+		shutdownCh:  make(chan struct{}),
+	}
+
+	go r.run()
+	return r, nil
+}
+
+// run is a long running goroutine that runs the Raft FSM
+func (r *Raft) run() {
+	for {
+		// Check if we are doing a shutdown
+		select {
+		case <-r.shutdownCh:
+			return
+		default:
+		}
+
+		switch r.state {
+		case Follower:
+			r.runFollower()
+		case Candidate:
+			r.runCandidate()
+		case Leader:
+			r.runLeader()
+		}
+	}
+}
+
+// runFollower runs the FSM for a follower
+func (r *Raft) runFollower() {
+	for {
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+// runCandidate runs the FSM for a candidate
+func (r *Raft) runCandidate() {
+	for {
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+// runLeader runs the FSM for a leader
+func (r *Raft) runLeader() {
+	for {
+		select {
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+// Shutdown is used to stop the Raft background routines.
+// This is not a graceful operation.
+func (r *Raft) Shutdown() {
+	r.shutdownLock.Lock()
+	defer r.shutdownLock.Lock()
+
+	if r.shutdownCh != nil {
+		close(r.shutdownCh)
+		r.shutdownCh = nil
+	}
+}

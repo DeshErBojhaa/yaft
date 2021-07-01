@@ -1,6 +1,7 @@
 package yaft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -24,6 +25,11 @@ const (
 	// Leader handles all write request. Leader is not expected
 	// to change very often.
 	Leader
+)
+
+var (
+	keyLastVoteTerm = []byte("LastVoteTerm")
+	keyLastVoteCand = []byte("LastVoteCand")
 )
 
 type Raft struct {
@@ -206,10 +212,83 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 	return
 }
 
-// requestVote is invoked when we are in the follwer state and
-// get an request vote RPC call
-func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
-	// TODO
+// requestVote is called when node is in the follower state and
+// get an request vote for candidate.
+func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool){
+	// Setup a response
+	resp := &RequestVoteResponse{
+		Term:    r.currentTerm,
+		Granted: false,
+	}
+	var err error
+	defer rpc.Respond(resp, err)
+
+	// Check if we have an existing leader
+	if leader := r.leader; leader != nil {
+		r.logW.Printf("raft: Rejecting vote from %v since we have a leader: %v",
+			req.Candidate, leader)
+		err = errors.New("already have a leader")
+		return
+	}
+
+	// Ignore an older term
+	if req.Term < r.currentTerm {
+		err = errors.New("obsolete term")
+		return
+	}
+
+	// Increase the term if we see a newer one
+	if req.Term > r.currentTerm {
+		// Ensure transition to follower
+		r.state = Follower
+		r.currentTerm = req.Term
+		resp.Term = req.Term
+	}
+
+	// Check if we have voted yet
+	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+	if err != nil && err.Error() != "not found" {
+		r.logE.Printf("raft: Failed to get last vote term: %v", err)
+		return
+	}
+	lastVoteCandyBytes, err := r.stable.Get(keyLastVoteCand)
+	if err != nil && err.Error() != "not found" {
+		r.logE.Printf("raft: Failed to get last vote candidate: %v", err)
+		return
+	}
+
+	// Check if we've voted in this election before
+	if lastVoteTerm == req.Term && lastVoteCandyBytes != nil {
+		r.logW.Printf("raft: Duplicate RequestVote for same term: %d", req.Term)
+		if bytes.Compare(lastVoteCandyBytes, req.Candidate) == 0 {
+			r.logW.Printf("raft: Duplicate RequestVote from candidate: %s", req.Candidate)
+			resp.Granted = true
+		}
+		return
+	}
+
+	// Reject if their term is older
+	lastIdx, lastTerm := r.lastLogIndex, r.currentTerm
+	if lastTerm > req.LastLogTerm {
+		r.logW.Printf("raft: Rejecting vote from %v since our last term is greater (%d, %d)",
+			req.Candidate, lastTerm, req.LastLogTerm)
+		return
+	}
+
+	if lastIdx > req.LastLogIndex {
+		r.logW.Printf("raft: Rejecting vote from %v since our last index is greater (%d, %d)",
+			req.Candidate, lastIdx, req.LastLogIndex)
+		return
+	}
+
+	// Persist a vote for safety
+	if err := r.persistVote(req.Term, string(req.Candidate)); err != nil {
+		r.logE.Printf("raft: Failed to persist vote: %v", err)
+		return
+	}
+
+	resp.Granted = true
+	return
 }
 
 // runFollower runs the FSM for a follower
@@ -298,4 +377,15 @@ func min(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// persistVote is used to persist our vote for safety
+func (r *Raft) persistVote(term uint64, candidate string) error {
+	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
+		return err
+	}
+	if err := r.stable.Set(keyLastVoteCand, []byte(candidate)); err != nil {
+		return err
+	}
+	return nil
 }

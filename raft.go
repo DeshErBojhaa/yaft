@@ -96,6 +96,8 @@ type Raft struct {
 	logW *log.Logger
 	// log errors
 	logE *log.Logger
+	// log debug + info
+	logD *log.Logger
 
 	// peers ...
 	peers []net.Addr
@@ -103,6 +105,12 @@ type Raft struct {
 
 // NewRaft is used to construct a new Raft node
 func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
+	// Try to restore the current term
+	currentTerm, err := store.GetUint64(keyCurrentTerm)
+	if err != nil && errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("failed to load current term: %v", err)
+	}
+
 	lastLog, err := logs.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to find last log: %v", err)
@@ -118,8 +126,10 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		fsm:          fsm,
 		shutdownCh:   make(chan struct{}),
 		lastLogIndex: lastLog,
+		currentTerm:  currentTerm,
 		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
 		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
+		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
 	}
 
 	go r.run()
@@ -128,6 +138,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 
 // run is a long running goroutine that runs the Raft FSM
 func (r *Raft) run() {
+	ch := r.trans.Consume()
 	for {
 		// Check if we are doing a shutdown
 		select {
@@ -138,11 +149,11 @@ func (r *Raft) run() {
 
 		switch r.state {
 		case Follower:
-			r.runFollower()
+			r.runFollower(ch)
 		case Candidate:
-			r.runCandidate()
+			r.runCandidate(ch)
 		case Leader:
-			r.runLeader()
+			r.runLeader(ch)
 		}
 	}
 }
@@ -355,7 +366,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 
 	// Persist a vote for ourselves
 	if err := r.persistVote(req.Term, req.Candidate); err != nil {
-		log.Printf("[ERR] Failed to persist vote : %v", err)
+		r.logE.Printf("Failed to persist vote : %v", err)
 		return nil
 	}
 
@@ -365,8 +376,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 }
 
 // runFollower runs the FSM for a follower
-func (r *Raft) runFollower() {
-	ch := r.trans.Consume()
+func (r *Raft) runFollower(ch <-chan RPC) {
 	for {
 		select {
 		case rpc := <-ch:
@@ -393,21 +403,61 @@ func (r *Raft) runFollower() {
 }
 
 // runCandidate runs the FSM for a candidate
-func (r *Raft) runCandidate() {
-	ch := r.trans.Consume()
-	for {
+func (r *Raft) runCandidate(ch <-chan RPC) {
+	// Start vote for us, and set a timeout
+	voteCh := r.electSelf()
+	electionTimeout := randomTimeout(r.conf.ElectionTimeout, 2*r.conf.ElectionTimeout)
+
+	// Tally the votes, need a simple majority
+	grantedVotes := 0
+	clusterSize := len(r.peers) + 1
+	quorum := (clusterSize / 2) + 1
+	r.logD.Printf("Cluster size: %d, votes needed: %d", clusterSize, quorum)
+
+	transition := false
+	for !transition {
 		select {
 		case rpc := <-ch:
-			// Handle the command
-			switch rpc.Command.(type) {
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				transition = r.appendEntries(rpc, cmd)
+			case *RequestVoteRequest:
+				transition = r.requestVote(rpc, cmd)
 			default:
-				r.logE.Printf("Candidate state, got unexpected command: %#v", rpc.Command)
+				r.logE.Printf("Candidate state, got unexpected command: %#v",
+					rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
 
-		case <-randomTimeout(r.conf.ElectionTimeout, r.conf.ElectionTimeout*2):
+		// Got response from peers on voting request
+		case vote := <-voteCh:
+			// Check if the term is greater than ours, bail
+			if vote.Term > r.currentTerm {
+				r.logD.Printf("Newer term discovered")
+				r.state = Follower
+				if err := r.setCurrentTerm(vote.Term); err != nil {
+					r.logE.Printf("Failed to update current term: %v", err)
+				}
+				return
+			}
+
+			// Check if the vote is granted
+			if vote.Granted {
+				grantedVotes++
+				r.logD.Printf("Vote granted. Tally: %d", grantedVotes)
+			}
+
+			// Check if we've become the leader
+			if grantedVotes >= quorum {
+				r.logD.Printf("Election won. Tally: %d", grantedVotes)
+				r.state = Leader
+				return
+			}
+
+		case <-electionTimeout:
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
+			r.logW.Printf("Election timeout reached, restarting election")
 			return
 
 		case <-r.shutdownCh:
@@ -417,7 +467,8 @@ func (r *Raft) runCandidate() {
 }
 
 // runLeader runs the FSM for a leader
-func (r *Raft) runLeader() {
+func (r *Raft) runLeader(ch <-chan RPC) {
+	<-ch // Shut up IDE!!
 	for {
 		select {
 		case <-r.shutdownCh:

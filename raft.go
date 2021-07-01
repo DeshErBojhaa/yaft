@@ -1,6 +1,8 @@
 package yaft
 
 import (
+	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -64,7 +66,7 @@ type Raft struct {
 	// term changes.
 	uncommittedSize uint64
 
-	// TODO: transport? TCP?
+	trans Transport
 }
 
 // NewRaft is used to construct a new Raft node
@@ -104,11 +106,40 @@ func (r *Raft) run() {
 		}
 	}
 }
+// followerAppendEntries is invoked when we are in the follwer state and
+// get an append entries RPC call
+func (r *Raft) followerAppendEntries(rpc RPC, a *AppendEntriesRequest) {
+	// TODO
+}
+
+// followerRequestVote is invoked when we are in the follwer state and
+// get an request vote RPC call
+func (r *Raft) followerRequestVote(rpc RPC, req *RequestVoteRequest) {
+	// TODO
+}
 
 // runFollower runs the FSM for a follower
 func (r *Raft) runFollower() {
+	ch := r.trans.Consume()
 	for {
 		select {
+		case rpc := <-ch:
+			// Handle the command
+			switch cmd := rpc.Command.(type) {
+			case *AppendEntriesRequest:
+				r.followerAppendEntries(rpc, cmd)
+			case *RequestVoteRequest:
+				r.followerRequestVote(rpc, cmd)
+			default:
+				log.Printf("[ERR] in follower state, got unexpected command: %#v", rpc.Command)
+				rpc.Respond(nil, fmt.Errorf("unexpected command"))
+			}
+
+		case <-randomTimeout(r.conf.HeartbeatTimeout, r.conf.ElectionTimeout):
+			// Heartbeat failed! Go to the candidate state
+			r.state = Candidate
+			return
+
 		case <-r.shutdownCh:
 			return
 		}

@@ -577,35 +577,41 @@ func (r *Raft) runFSM() {
 	for {
 		select {
 		case commitTuple := <-r.commitCh:
-			// Reject obsolete logs
+			// obsolete logs
 			if commitTuple.index <= r.getLastApplied() {
 				r.logW.Printf("Skipping application of old log: %d",
 					commitTuple.index)
 				continue
 			}
-			// Get the log, either from the deferLog or from our log store
-			var l *Log
-			if commitTuple.deferLog != nil {
-				l = &commitTuple.deferLog.log
-			} else {
-				l = new(Log)
-				if err := r.logs.GetLog(commitTuple.index, l); err != nil {
-					r.logE.Printf("Failed to get log: %v", err)
-					panic(err)
+
+			// Apply all the preceding logs
+			for idx := r.getLastApplied() + 1; idx <= commitTuple.index; idx++ {
+				// Get the log, either from the future or from our log store
+				var l *Log
+				if commitTuple.deferLog != nil && commitTuple.deferLog.log.Index == idx {
+					l = &commitTuple.deferLog.log
+				} else {
+					l = new(Log)
+					if err := r.logs.GetLog(idx, l); err != nil {
+						r.logE.Printf("Failed to get log at %d: %v", idx, err)
+						panic(err)
+					}
 				}
+
+				// Only apply commands, ignore other logs
+				if l.Type == LogCommand {
+					r.fsm.Apply(l.Data)
+				}
+
+				// Update the lastApplied
+				r.setLastApplied(l.Index)
 			}
 
-			// Only apply commands, ignore other logs
-			if l.Type == LogCommand {
-				r.fsm.Apply(l.Data)
-			}
-
-			// Invoke the deferLog if given
+			// Invoke the future if given
 			if commitTuple.deferLog != nil {
+				commitTuple.deferLog.response = nil
 				commitTuple.deferLog.Response()
 			}
-			// Update the lastApplied
-			r.setLastApplied(l.Index)
 
 		case <-r.shutdownCh:
 			return

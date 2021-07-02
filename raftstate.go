@@ -50,11 +50,11 @@ func (r *raftState) setCurrentTerm(term uint64) {
 	atomic.StoreUint64(&r.currentTerm, term)
 }
 
-func (r *raftState) getLastLog() uint64 {
+func (r *raftState) getLastLogIndex() uint64 {
 	return atomic.LoadUint64(&r.lastLogIndex)
 }
 
-func (r *raftState) setLastLog(term uint64) {
+func (r *raftState) setLastLogIndex(term uint64) {
 	atomic.StoreUint64(&r.lastLogIndex, term)
 }
 

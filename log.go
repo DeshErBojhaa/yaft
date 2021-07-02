@@ -6,7 +6,12 @@ import "net"
 type LogType uint8
 
 // LogCommand is applied to a user FSM.
-const LogCommand LogType = iota
+const (
+	LogCommand LogType = iota
+
+	// LogNoop is used to assert leadership
+	LogNoop
+)
 
 // Log entries are replicated to all members of the Raft cluster
 // and form the heart of the replicated state machine.

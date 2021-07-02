@@ -519,6 +519,8 @@ func (r *Raft) runLeader() {
 	for i, peer := range r.peers {
 		go r.replicate(inflight, triggers[i], stopCh, peer)
 	}
+	// seal leadership
+	go r.leaderNoop()
 
 	transition := false
 	for !transition {
@@ -569,6 +571,17 @@ func (r *Raft) runLeader() {
 			return
 		}
 	}
+}
+
+// leaderNoop is a blocking command that appends a no-op log
+// entry. It is used to seal leadership.
+func (r *Raft) leaderNoop() {
+	logFuture := &DeferLog{
+		log: Log{
+			Type: LogNoop,
+		},
+	}
+	r.applyCh <- logFuture
 }
 
 // runFSM is a long running goroutine responsible for the management

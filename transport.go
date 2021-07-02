@@ -27,6 +27,9 @@ type Transport interface {
 	// consume and respond to RPC requests.
 	Consume() <-chan RPC
 
+	// LocalAddr is used to return the local address to distinguish from our peers
+	LocalAddr() net.Addr
+
 	// AppendEntries sends the appropriate RPC to the target node
 	AppendEntries(target net.Addr, args *AppendEntriesRequest, resp *AppendEntriesResponse) error
 

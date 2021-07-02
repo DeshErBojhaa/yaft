@@ -11,7 +11,7 @@ func TestInflight_StartCommit(t *testing.T) {
 
 	// Commit a transaction as being in flight
 	l := &DeferLog{
-		log: Log{Index: 1},
+		log:        Log{Index: 1},
 		DeferError: DeferError{errCh: make(chan error)},
 	}
 	in.Start(l, 3)
@@ -45,7 +45,7 @@ func TestInflight_Cancel(t *testing.T) {
 
 	// Commit a transaction as being in flight
 	l := &DeferLog{
-		log: Log{Index: 1},
+		log:        Log{Index: 1},
 		DeferError: DeferError{errCh: make(chan error)},
 	}
 	in.Start(l, 3)

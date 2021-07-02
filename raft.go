@@ -13,22 +13,6 @@ import (
 	"time"
 )
 
-type RaftState uint8
-
-const (
-	// Follower indicates current node in follower state.
-	// From follower, it can become candidate and ask for vote.
-	Follower RaftState = iota
-
-	// Candidate is when a follower has not received heartbeat from
-	// the leader for some time, so it decides to step up.
-	Candidate
-
-	// Leader handles all write request. Leader is not expected
-	// to change very often.
-	Leader
-)
-
 var (
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
@@ -39,26 +23,20 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrNotLeader is used when a
 	ErrNotLeader = fmt.Errorf("node is not the leader")
+	// ErrLeadershipLost ...
+	ErrLeadershipLost = fmt.Errorf("leadership lost while committing log")
 )
 
 type Raft struct {
+	raftState
 	// Configuration
 	conf *Config
-
-	// Current state
-	state RaftState
 
 	// stable is a Store implementation for durable state
 	stable Store
 
 	// logs is a LogStore implementation to keep our logs
 	logs LogStore
-
-	// Highest committed log entry
-	commitIndex uint64
-
-	// Last applied log to the FSM
-	lastApplied uint64
 
 	// FSM is a finite state machine handler for logs
 	fsm FSM
@@ -84,12 +62,6 @@ type Raft struct {
 
 	// Transport layer. Most probably TCP.
 	trans Transport
-
-	// Cache the current term, write through to StableStore
-	currentTerm uint64
-
-	// Cache the latest log index, though we can get from LogStore
-	lastLogIndex uint64
 
 	// Log warnings
 	logW *log.Logger
@@ -131,22 +103,23 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 	}
 
 	r := &Raft{
-		conf:         conf,
-		state:        Follower,
-		stable:       store,
-		logs:         logs,
-		commitIndex:  0,
-		lastApplied:  0,
-		fsm:          fsm,
-		shutdownCh:   make(chan struct{}),
-		lastLogIndex: lastLog,
-		currentTerm:  currentTerm,
-		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
-		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
-		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
-		commitCh:     make(chan commitTuple, 128),
-		applyCh:      make(chan *DeferLog),
+		conf:       conf,
+		stable:     store,
+		logs:       logs,
+		fsm:        fsm,
+		shutdownCh: make(chan struct{}),
+		logE:       log.New(os.Stdout, "[ERROR]", log.LstdFlags),
+		logW:       log.New(os.Stdout, "[WARN]", log.LstdFlags),
+		logD:       log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
+		commitCh:   make(chan commitTuple, 128),
+		applyCh:    make(chan *DeferLog),
 	}
+	// Initialize as a follower
+	r.setState(Follower)
+
+	// Restore the current term and the last log
+	_ = r.setCurrentTerm(currentTerm)
+	r.setLastLog(lastLog)
 
 	go r.run()
 	go r.runFSM()
@@ -450,7 +423,7 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 	// Tally the votes, need a simple majority
 	grantedVotes := 0
 	quorum := r.quorumSize()
-	r.logD.Printf("Cluster size: %d, votes needed: %d", len(r.peers) + 1, quorum)
+	r.logD.Printf("Cluster size: %d, votes needed: %d", len(r.peers)+1, quorum)
 
 	transition := false
 	for !transition {
@@ -514,7 +487,7 @@ func (r *Raft) runLeader(ch <-chan RPC) {
 	// of all inflight processes when we step down
 	commitCh := make(chan *DeferLog)
 	inflight := NewInflight(commitCh)
-	defer inflight.Cancel(ErrNotLeader)
+	defer inflight.Cancel(ErrLeadershipLost)
 
 	// signal all peers that current node is stepping down.
 	stopCh := make(chan struct{})
@@ -585,6 +558,12 @@ func (r *Raft) runFSM() {
 	for {
 		select {
 		case commitTuple := <-r.commitCh:
+			// Reject obsolete logs
+			if commitTuple.index <= r.lastApplied {
+				r.logW.Printf("Skipping application of old log: %d",
+					commitTuple.index)
+				continue
+			}
 			// Get the log, either from the deferLog or from our log store
 			var l *Log
 			if commitTuple.deferLog != nil {
@@ -606,6 +585,8 @@ func (r *Raft) runFSM() {
 			if commitTuple.deferLog != nil {
 				commitTuple.deferLog.Response()
 			}
+			// Update the lastApplied
+			r.lastApplied = l.Index
 
 		case <-r.shutdownCh:
 			return

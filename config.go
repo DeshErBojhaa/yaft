@@ -22,8 +22,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		HeartbeatTimeout: 100 * time.Millisecond,
-		ElectionTimeout: 150 * time.Millisecond,
-		CommitTimeout: 5 * time.Millisecond,
+		ElectionTimeout:  150 * time.Millisecond,
+		CommitTimeout:    5 * time.Millisecond,
 	}
 }
-

@@ -38,7 +38,7 @@ var (
 	// ErrNotFound is used in persistence layer
 	ErrNotFound = errors.New("not found")
 	// ErrNotLeader is used when a
-	ErrNotLeader       = fmt.Errorf("node is not the leader")
+	ErrNotLeader = fmt.Errorf("node is not the leader")
 )
 
 type Raft struct {
@@ -107,7 +107,7 @@ type Raft struct {
 	commitCh chan uint64
 
 	// applyCh is used to manage commands to be applied
-	applyCh chan *deferLog
+	applyCh chan *DeferLog
 }
 
 // NewRaft is used to construct a new Raft node
@@ -137,8 +137,8 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
 		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
 		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
-		commitCh:    make(chan uint64, 128),
-		applyCh:     make(chan *deferLog),
+		commitCh:     make(chan uint64, 128),
+		applyCh:      make(chan *DeferLog),
 	}
 
 	go r.run()
@@ -173,12 +173,12 @@ func (r *Raft) run() {
 // for the command to be started.
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 	if timeout <= 0 {
-		return &deferError{err: fmt.Errorf("invalid timeout %v", timeout)}
+		return &DeferError{err: fmt.Errorf("invalid timeout %v", timeout)}
 	}
 	var timer = time.After(timeout)
 
 	// Create a log future, no index or term yet
-	logFuture := &deferLog{
+	logFuture := &DeferLog{
 		log: Log{
 			Type: LogCommand,
 			Data: cmd,
@@ -188,7 +188,7 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 
 	select {
 	case <-timer:
-		return &deferError{err: fmt.Errorf("timed out enqueuing operation")}
+		return &DeferError{err: fmt.Errorf("timed out enqueuing operation")}
 	case r.applyCh <- logFuture:
 		return logFuture
 	}
@@ -645,7 +645,6 @@ func (r *Raft) heartbeat(peer net.Addr) {
 	}
 }
 
-
 // generateUUID is used to generate a random UUID
 func generateUUID() string {
 	buf := make([]byte, 16)
@@ -659,4 +658,15 @@ func generateUUID() string {
 		buf[6:8],
 		buf[8:10],
 		buf[10:16])
+}
+
+// asyncNotify is used to do an async channel send to
+// a list of channels. This will not block.
+func asyncNotify(chans []chan struct{}) {
+	for _, ch := range chans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }

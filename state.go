@@ -13,4 +13,3 @@ type FollowerState struct {
 	// This is the last known replicated index
 	replicatedIndex uint64
 }
-

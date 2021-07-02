@@ -35,4 +35,3 @@ type Transport interface {
 
 	//TODO: Snapshots?
 }
-

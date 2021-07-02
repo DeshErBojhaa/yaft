@@ -15,19 +15,19 @@ type ApplyDefer interface {
 	Response() interface{}
 }
 
-// deferError can be embedded to allow a future
+// DeferError can be embedded to allow a future
 // to provide an error in the future
-type deferError struct {
+type DeferError struct {
 	err       error
 	errCh     chan error
 	responded bool
 }
 
-func (d *deferError) init() {
+func (d *DeferError) init() {
 	d.errCh = make(chan error, 1)
 }
 
-func (d *deferError) Error() error {
+func (d *DeferError) Error() error {
 	if d.err != nil {
 		return d.err
 	}
@@ -38,25 +38,25 @@ func (d *deferError) Error() error {
 	return d.err
 }
 
-func (d *deferError) Response() interface{}{
+func (d *DeferError) Response() interface{} {
 	return nil
 }
 
-// deferLog is used to apply a log entry and waits until
+// DeferLog is used to apply a log entry and waits until
 // the log is considered committed
-type deferLog struct {
-	deferError
+type DeferLog struct {
+	DeferError
 	log      Log
 	quorum   majorityQuorum
 	response interface{}
 	dispatch time.Time
 }
 
-func (d *deferLog) Error() error {
-	return d.deferError.Error()
+func (d *DeferLog) Error() error {
+	return d.DeferError.Error()
 }
 
-func (d *deferLog) Response() interface{} {
+func (d *DeferLog) Response() interface{} {
 	return d.response
 }
 

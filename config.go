@@ -15,6 +15,10 @@ type Config struct {
 	// a timely commit. Should be far less than HeartbeatTimeout to ensure
 	// we don't lose leadership.
 	CommitTimeout time.Duration
+
+	// MaxAppendEntries controls the maximum number of append entries
+	// to send at once.
+	MaxAppendEntries int
 }
 
 //DefaultConfig is used on bootstrap if other configs are
@@ -24,5 +28,6 @@ func DefaultConfig() *Config {
 		HeartbeatTimeout: 100 * time.Millisecond,
 		ElectionTimeout:  150 * time.Millisecond,
 		CommitTimeout:    5 * time.Millisecond,
+		MaxAppendEntries: 16,
 	}
 }

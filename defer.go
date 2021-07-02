@@ -4,7 +4,7 @@ import (
 	"time"
 )
 
-// Defer is used to represent an action that may occur in the future
+// Defer is used to represent an action that may occur in the deferLog
 type Defer interface {
 	Error() error
 }
@@ -15,8 +15,8 @@ type ApplyDefer interface {
 	Response() interface{}
 }
 
-// DeferError can be embedded to allow a future
-// to provide an error in the future
+// DeferError can be embedded to allow a deferLog
+// to provide an error in the deferLog
 type DeferError struct {
 	err       error
 	errCh     chan error

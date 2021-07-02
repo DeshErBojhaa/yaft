@@ -104,10 +104,17 @@ type Raft struct {
 	// commitCh is used to provide the newest commit index
 	// so that changes can be applied to the FSM. This is used
 	// so the main goroutine can use commitIndex without locking.
-	commitCh chan uint64
+	commitCh chan commitTuple
 
 	// applyCh is used to manage commands to be applied
 	applyCh chan *DeferLog
+}
+
+// commitTupel is used to send an index that was committed,
+// with an optional associated deferLog that should be invoked
+type commitTuple struct {
+	index    uint64
+	deferLog *DeferLog
 }
 
 // NewRaft is used to construct a new Raft node
@@ -137,11 +144,12 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		logE:         log.New(os.Stdout, "[ERROR]", log.LstdFlags),
 		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
 		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
-		commitCh:     make(chan uint64, 128),
+		commitCh:     make(chan commitTuple, 128),
 		applyCh:      make(chan *DeferLog),
 	}
 
 	go r.run()
+	go r.runFSM()
 	return r, nil
 }
 
@@ -177,7 +185,7 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 	}
 	var timer = time.After(timeout)
 
-	// Create a log future, no index or term yet
+	// Create a log deferLog, no index or term yet
 	logFuture := &DeferLog{
 		log: Log{
 			Type: LogCommand,
@@ -261,7 +269,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 	if a.LeaderCommitIndex > r.commitIndex {
 		r.commitIndex = min(a.LeaderCommitIndex, r.lastLogIndex)
 		// Trigger applying logs locally
-		r.commitCh <- r.commitIndex
+		r.commitCh <- commitTuple{r.commitIndex, nil}
 	}
 
 	// Set success
@@ -420,7 +428,7 @@ func (r *Raft) runFollower(ch <-chan RPC) {
 			}
 		case a := <-r.applyCh:
 			// Reject any operations since we are not the leader
-			a.response = ErrNotLeader // TODO: Fix
+			a.response = ErrNotLeader
 			a.Response()
 		case <-randomTimeout(r.conf.HeartbeatTimeout, r.conf.ElectionTimeout):
 			// Heartbeat failed! Go to the candidate state
@@ -441,9 +449,8 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 
 	// Tally the votes, need a simple majority
 	grantedVotes := 0
-	clusterSize := len(r.peers) + 1
-	quorum := (clusterSize / 2) + 1
-	r.logD.Printf("Cluster size: %d, votes needed: %d", clusterSize, quorum)
+	quorum := r.quorumSize()
+	r.logD.Printf("Cluster size: %d, votes needed: %d", len(r.peers) + 1, quorum)
 
 	transition := false
 	for !transition {
@@ -503,6 +510,12 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 
 // runLeader runs the FSM for a leader
 func (r *Raft) runLeader(ch <-chan RPC) {
+	// Make a channel to processes commits, defer cancellation
+	// of all inflight processes when we step down
+	commitCh := make(chan *DeferLog)
+	inflight := NewInflight(commitCh)
+	defer inflight.Cancel(ErrNotLeader)
+
 	// signal all peers that current node is stepping down.
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -521,6 +534,34 @@ func (r *Raft) runLeader(ch <-chan RPC) {
 	transition := false
 	for !transition {
 		select {
+		case applyLog := <-r.applyCh:
+			// Prepare log
+			applyLog.log.Index = r.lastLogIndex + 1
+			applyLog.log.Term = r.currentTerm
+
+			// Write the log entry locally
+			if err := r.logs.StoreLog(&applyLog.log); err != nil {
+				r.logE.Printf("Failed to commit log: %v", err)
+				applyLog.response = err
+				applyLog.Response()
+				r.state = Follower
+				return
+			}
+			r.lastLogIndex++
+
+			// Add this to the inflight logs
+			inflight.Start(applyLog, r.quorumSize())
+
+			// Notify the replicators of the new log
+			asyncNotify(triggers)
+
+		case commitLog := <-commitCh:
+			// Increment the commit index
+			r.commitIndex = commitLog.log.Index
+
+			// Trigger applying logs locally
+			r.commitCh <- commitTuple{commitLog.log.Index, commitLog}
+
 		case rpc := <-ch:
 			switch cmd := rpc.Command.(type) {
 			case *AppendEntriesRequest:
@@ -528,11 +569,43 @@ func (r *Raft) runLeader(ch <-chan RPC) {
 			case *RequestVoteRequest:
 				transition = r.requestVote(rpc, cmd)
 			default:
-				r.logE.Printf("Leader state, got unexpected command: %#v",
+				log.Printf("[ERR] Leaderstate, got unexpected command: %#v",
 					rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
-		case <-r.applyCh:
+		case <-r.shutdownCh:
+			return
+		}
+	}
+}
+
+// runFSM is a long running goroutine responsible for the management
+// of the local FSM.
+func (r *Raft) runFSM() {
+	for {
+		select {
+		case commitTuple := <-r.commitCh:
+			// Get the log, either from the deferLog or from our log store
+			var l *Log
+			if commitTuple.deferLog != nil {
+				l = &commitTuple.deferLog.log
+			} else {
+				l = new(Log)
+				if err := r.logs.GetLog(commitTuple.index, l); err != nil {
+					r.logE.Printf("Failed to get log: %v", err)
+					panic(err)
+				}
+			}
+
+			// Only apply commands, ignore other logs
+			if l.Type == LogCommand {
+				r.fsm.Apply(l.Data)
+			}
+
+			// Invoke the deferLog if given
+			if commitTuple.deferLog != nil {
+				commitTuple.deferLog.Response()
+			}
 
 		case <-r.shutdownCh:
 			return
@@ -645,6 +718,12 @@ func (r *Raft) heartbeat(peer net.Addr) {
 	}
 }
 
+func (r *Raft) quorumSize() int {
+	clusterSize := len(r.peers) + 1
+	votesNeeded := (clusterSize / 2) + 1
+	return votesNeeded
+}
+
 // generateUUID is used to generate a random UUID
 func generateUUID() string {
 	buf := make([]byte, 16)
@@ -662,8 +741,8 @@ func generateUUID() string {
 
 // asyncNotify is used to do an async channel send to
 // a list of channels. This will not block.
-func asyncNotify(chans []chan struct{}) {
-	for _, ch := range chans {
+func asyncNotify(chs []chan struct{}) {
+	for _, ch := range chs {
 		select {
 		case ch <- struct{}{}:
 		default:

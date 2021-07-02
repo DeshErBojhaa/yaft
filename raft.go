@@ -93,7 +93,7 @@ type commitTuple struct {
 }
 
 // NewRaft is used to construct a new Raft node
-func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM, trans Transport) (*Raft, error) {
+func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM, trans Transport) (*Raft, error) {
 	// Try to restore the current term
 	currentTerm, err := store.GetUint64(keyCurrentTerm)
 	if err != nil && errors.Is(err, ErrNotFound) {
@@ -103,6 +103,15 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM, trans Transport)
 	lastLog, err := logs.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("failed to find last log: %v", err)
+	}
+
+	// Construct the list of peers that excludes us
+	localAddr := trans.LocalAddr()
+	otherPeers := make([]net.Addr, 0, len(peers))
+	for _, p := range peers {
+		if p.String() != localAddr.String() {
+			otherPeers = append(otherPeers, p)
+		}
 	}
 
 	r := &Raft{
@@ -117,6 +126,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM, trans Transport)
 		commitCh:   make(chan commitTuple, 128),
 		applyCh:    make(chan *DeferLog),
 		rpcCh:      trans.Consume(),
+		peers:      otherPeers,
 	}
 	// Initialize as a follower
 	r.setState(Follower)

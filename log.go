@@ -5,6 +5,8 @@ import "net"
 // LogType describes various types of log entries.
 type LogType uint8
 
+// LogCommand is applied to a user FSM.
+const LogCommand LogType = iota
 
 // Log entries are replicated to all members of the Raft cluster
 // and form the heart of the replicated state machine.

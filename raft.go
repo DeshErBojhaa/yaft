@@ -37,6 +37,8 @@ var (
 
 	// ErrNotFound is used in persistence layer
 	ErrNotFound = errors.New("not found")
+	// ErrNotLeader is used when a
+	ErrNotLeader       = fmt.Errorf("node is not the leader")
 )
 
 type Raft struct {
@@ -106,6 +108,9 @@ type Raft struct {
 	// so that changes can be applied to the FSM. This is used
 	// so the main goroutine can use commitIndex without locking.
 	commitCh chan uint64
+
+	// applyCh is used to manage commands to be applyed
+	applyCh chan *deferLog
 }
 
 // NewRaft is used to construct a new Raft node
@@ -136,6 +141,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, fsm FSM) (*Raft, error) {
 		logW:         log.New(os.Stdout, "[WARN]", log.LstdFlags),
 		logD:         log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
 		commitCh:    make(chan uint64, 128),
+		applyCh:     make(chan *deferLog),
 	}
 
 	go r.run()
@@ -161,6 +167,33 @@ func (r *Raft) run() {
 		case Leader:
 			r.runLeader(ch)
 		}
+	}
+}
+
+// Apply is used to apply a command to the FSM in a highly consistent
+// manner. This returns a defer that can be used to wait on the application.
+// An optional timeout can be provided to limit the amount of time we wait
+// for the command to be started.
+func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
+	if timeout <= 0 {
+		return &deferError{err: fmt.Errorf("invalid timeout %v", timeout)}
+	}
+	var timer = time.After(timeout)
+
+	// Create a log future, no index or term yet
+	logFuture := &deferLog{
+		log: Log{
+			Type: LogCommand,
+			Data: cmd,
+		},
+	}
+	logFuture.init()
+
+	select {
+	case <-timer:
+		return &deferError{err: fmt.Errorf("timed out enqueuing operation")}
+	case r.applyCh <- logFuture:
+		return logFuture
 	}
 }
 
@@ -396,7 +429,10 @@ func (r *Raft) runFollower(ch <-chan RPC) {
 				r.logE.Printf("In follower state, got unexpected command: %#v", rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
-
+		case a := <-r.applyCh:
+			// Reject any operations since we are not the leader
+			a.response = ErrNotLeader // TODO: Fix
+			a.Response()
 		case <-randomTimeout(r.conf.HeartbeatTimeout, r.conf.ElectionTimeout):
 			// Heartbeat failed! Go to the candidate state
 			r.state = Candidate
@@ -459,6 +495,10 @@ func (r *Raft) runCandidate(ch <-chan RPC) {
 				r.state = Leader
 				return
 			}
+		case a := <-r.applyCh:
+			// Reject any operations since we are not the leader
+			a.response = ErrNotLeader // TODO: Fix
+			a.Response()
 
 		case <-electionTimeout:
 			// Election failed! Restart the election. We simply return,
@@ -488,6 +528,7 @@ func (r *Raft) runLeader(ch <-chan RPC) {
 					rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
+		case <-r.applyCh:
 
 		case <-r.shutdownCh:
 			return

@@ -60,9 +60,6 @@ type Raft struct {
 	// Last applied log to the FSM
 	lastApplied uint64
 
-	// If we are the leader, we have extra state
-	leader *LeaderState
-
 	// FSM is a finite state machine handler for logs
 	fsm FSM
 
@@ -109,7 +106,7 @@ type Raft struct {
 	// so the main goroutine can use commitIndex without locking.
 	commitCh chan uint64
 
-	// applyCh is used to manage commands to be applyed
+	// applyCh is used to manage commands to be applied
 	applyCh chan *deferLog
 }
 
@@ -286,14 +283,6 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 	// Ignore an older term
 	if req.Term < r.currentTerm {
 		err = errors.New("obsolete term")
-		return
-	}
-
-	// Check if we have an existing leader
-	if leader := r.leader; leader != nil {
-		r.logW.Printf("raft: Rejecting vote from %v since we have a leader: %v",
-			req.Candidate, leader)
-		err = errors.New("already have a leader")
 		return
 	}
 

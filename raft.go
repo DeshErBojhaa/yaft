@@ -16,7 +16,6 @@ import (
 var (
 	keyLastVoteTerm = []byte("LastVoteTerm")
 	keyLastVoteCand = []byte("LastVoteCand")
-	keyCandidateId  = []byte("CandidateId")
 	keyCurrentTerm  = []byte("CurrentTerm")
 
 	// ErrNotFound is used in persistence layer
@@ -90,7 +89,6 @@ type Raft struct {
 	// Stores our local addr
 	localAddr net.Addr
 
-	candidateIdCache []byte
 }
 
 // commitTupel is used to send an index that was committed,
@@ -144,7 +142,6 @@ func NewRaft(conf *Config, store Store, logs LogStore, peerStore PeerStore, fsm 
 	// Restore the current term and the last log
 	_ = r.setCurrentTerm(currentTerm)
 	r.setLastLogIndex(lastLog)
-	r.CandidateId()
 
 	go r.run()
 	go r.runFSM()
@@ -152,7 +149,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, peerStore PeerStore, fsm 
 }
 
 func (r *Raft) String() string {
-	return fmt.Sprintf("Node %s at %s", r.CandidateId(), r.localAddr.String())
+	return fmt.Sprintf("Node %s", r.localAddr.String())
 }
 
 // run is a long running goroutine that runs the Raft FSM
@@ -305,7 +302,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 	}
 
 	// Update the commit index
-	if a.LeaderCommitIndex > r.getCommitIndex() {
+	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
 		idx := min(a.LeaderCommitIndex, r.getLastLogIndex())
 		r.setCommitIndex(idx)
 
@@ -428,7 +425,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 	// Construct the request
 	req := &RequestVoteRequest{
 		Term:         r.getCurrentTerm(),
-		Candidate:    r.CandidateId(),
+		Candidate:    []byte(r.localAddr.String()),
 		LastLogIndex: lastLog.Index,
 		LastLogTerm:  lastLog.Term,
 	}
@@ -777,6 +774,7 @@ func (r *Raft) processLog(l *Log) {
 		if peer.String() != r.localAddr.String() {
 			r.peers = addUniquePeer(r.peers, peer)
 		}
+		_ = r.peerStore.SetPeers(r.peers)
 		r.peerLock.Unlock()
 
 	case LogRemovePeer:
@@ -789,6 +787,7 @@ func (r *Raft) processLog(l *Log) {
 		} else {
 			r.peers = excludePeer(r.peers, peer)
 		}
+		_ = r.peerStore.SetPeers(r.peers)
 		r.peerLock.Unlock()
 
 	case LogNoop:
@@ -840,32 +839,6 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 		return err
 	}
 	return nil
-}
-
-// CandidateId is used to return a stable and unique candidate ID
-func (r *Raft) CandidateId() []byte {
-	// Check cache
-	if r.candidateIdCache != nil {
-		return r.candidateIdCache
-	}
-
-	// Get the persistent id
-	raw, err := r.stable.Get(keyCandidateId)
-	if err == nil {
-		r.candidateIdCache = raw
-		return raw
-	}
-
-	// Generate a UUID on the first call
-	if errors.Is(err, ErrNotFound) {
-		id := generateUUID()
-		if err := r.stable.Set(keyCandidateId, []byte(id)); err != nil {
-			panic(fmt.Errorf("failed to write CandidateId: %w", err))
-		}
-		r.candidateIdCache = []byte(id)
-		return []byte(id)
-	}
-	panic(fmt.Errorf("failed to read CandidateId: %w", err))
 }
 
 // setCurrentTerm is used to set the current term in a durable manner

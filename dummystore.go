@@ -12,7 +12,6 @@ type DummyStore struct {
 	firstIndex uint64
 	lastIndex  uint64
 	logs       map[uint64]*Log
-
 }
 
 // NewDummyStore returns a new in-memory backend. Do not ever

@@ -50,7 +50,7 @@ func (i *inflight) Cancel(err error) {
 	// Respond to all in-flight operations
 	for _, op := range i.operations {
 		op.future.response = err
-		if op.future.DeferError.errCh == nil || cap(op.future.DeferError.errCh) == 0{
+		if op.future.DeferError.errCh == nil || cap(op.future.DeferError.errCh) == 0 {
 			//fmt.Println("NIL channel *****")
 			op.future.DeferError.init()
 		}

@@ -84,6 +84,10 @@ type Raft struct {
 
 	// rpcCh for transport layer
 	rpcCh <-chan RPC
+
+	// Stores our local addr
+	localAddr net.Addr
+
 }
 
 // commitTupel is used to send an index that was committed,
@@ -121,13 +125,15 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 		logs:       logs,
 		fsm:        fsm,
 		shutdownCh: make(chan struct{}),
-		logE:       log.New(os.Stdout, "[ERROR]", log.LstdFlags),
-		logW:       log.New(os.Stdout, "[WARN]", log.LstdFlags),
-		logD:       log.New(os.Stdout, "[DEBUG]", log.LstdFlags),
+		logE:       log.New(os.Stdout, "[ERROR]", log.LstdFlags|log.Lshortfile),
+		logW:       log.New(os.Stdout, "[WARN]", log.LstdFlags|log.Lshortfile),
+		logD:       log.New(os.Stdout, "[DEBUG]", log.LstdFlags|log.Lshortfile),
 		commitCh:   make(chan commitTuple, 128),
 		applyCh:    make(chan *DeferLog),
 		rpcCh:      trans.Consume(),
 		peers:      otherPeers,
+		trans:      trans,
+		localAddr: localAddr,
 	}
 	// Initialize as a follower
 	r.setState(Follower)
@@ -139,6 +145,10 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 	go r.run()
 	go r.runFSM()
 	return r, nil
+}
+
+func (r *Raft) String() string {
+	return fmt.Sprintf("Node %s at %s", r.CandidateId(), r.localAddr.String())
 }
 
 // run is a long running goroutine that runs the Raft FSM
@@ -170,7 +180,7 @@ func (r *Raft) State() RaftState {
 
 // Apply is used to apply a command to the FSM in a highly consistent
 // manner. This returns a defer that can be used to wait on the application.
-// An optional timeout can be provided to limit the amount of time we wait
+// An timeout should be provided to limit the amount of time we wait
 // for the command to be started.
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 	if timeout <= 0 {
@@ -179,19 +189,19 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 	var timer = time.After(timeout)
 
 	// Create a log deferLog, no index or term yet
-	logFuture := &DeferLog{
+	deferLog := &DeferLog{
 		log: Log{
 			Type: LogCommand,
 			Data: cmd,
 		},
 	}
-	logFuture.init()
+	deferLog.init()
 
 	select {
 	case <-timer:
 		return &DeferError{err: fmt.Errorf("timed out enqueuing operation")}
-	case r.applyCh <- logFuture:
-		return logFuture
+	case r.applyCh <- deferLog:
+		return deferLog
 	}
 }
 
@@ -225,15 +235,17 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 
 	// Verify the last log entry
 	var prevLog Log
-	if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
-		r.logW.Printf("Failed to get previous log: %d %v",
-			a.PrevLogEntry, err)
-		return
-	}
-	if a.PrevLogTerm != prevLog.Term {
-		r.logW.Printf("Previous log term mis-match: ours: %d remote: %d",
-			prevLog.Term, a.PrevLogTerm)
-		return
+	if a.PrevLogEntry > 0 {
+		if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
+			r.logW.Printf("Failed to get previous log: %d %v",
+				a.PrevLogEntry, err)
+			return
+		}
+		if a.PrevLogTerm != prevLog.Term {
+			r.logW.Printf("Previous log term mis-match: ours: %d remote: %d",
+				prevLog.Term, a.PrevLogTerm)
+			return
+		}
 	}
 
 	// Add all the entries
@@ -437,6 +449,7 @@ func (r *Raft) runFollower() {
 			a.Response()
 		case <-randomTimeout(r.conf.HeartbeatTimeout, r.conf.ElectionTimeout):
 			// Heartbeat failed! Go to the candidate state
+			r.logW.Printf("Heartbeat timeout, start election process")
 			r.setState(Candidate)
 			return
 
@@ -545,7 +558,6 @@ func (r *Raft) runLeader() {
 			// Prepare log
 			applyLog.log.Index = r.getLastLogIndex() + 1
 			applyLog.log.Term = r.getCurrentTerm()
-
 			// Write the log entry locally
 			if err := r.logs.StoreLog(&applyLog.log); err != nil {
 				r.logE.Printf("Failed to commit log: %v", err)
@@ -557,7 +569,7 @@ func (r *Raft) runLeader() {
 
 			// Add this to the inflight logs
 			inflight.Start(applyLog, r.quorumSize())
-
+			inflight.Commit(applyLog.log.Index)
 			// Update the last log since it's on disk now
 			r.setLastLogIndex(applyLog.log.Index)
 
@@ -568,7 +580,6 @@ func (r *Raft) runLeader() {
 			// Increment the commit index
 			idx := commitLog.log.Index
 			r.setCommitIndex(idx)
-
 			// Trigger applying logs locally
 			r.commitCh <- commitTuple{idx, commitLog}
 
@@ -579,7 +590,7 @@ func (r *Raft) runLeader() {
 			case *RequestVoteRequest:
 				transition = r.requestVote(rpc, cmd)
 			default:
-				log.Printf("[ERR] Leaderstate, got unexpected command: %#v",
+				r.logE.Printf("Leader state, got unexpected command: %#v",
 					rpc.Command)
 				rpc.Respond(nil, fmt.Errorf("unexpected command"))
 			}
@@ -638,7 +649,10 @@ func (r *Raft) runFSM() {
 
 			// Invoke the future if given
 			if commitTuple.deferLog != nil {
-				commitTuple.deferLog.response = nil
+				if commitTuple.deferLog.errCh == nil || cap(commitTuple.deferLog.errCh) == 0 {
+					commitTuple.deferLog.init()
+				}
+				commitTuple.deferLog.errCh <- nil
 				commitTuple.deferLog.Response()
 			}
 
@@ -758,7 +772,7 @@ START:
 		Leader:            r.CandidateId(),
 		LeaderCommitIndex: r.getCommitIndex(),
 	}
-
+	fmt.Printf("**** Index %#v\n", indexes)
 	// Log entry starts at 1
 	if indexes.nextIndex > 1 {
 		if err := r.logs.GetLog(indexes.nextIndex-1, &l); err != nil {

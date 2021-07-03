@@ -24,6 +24,8 @@ var (
 	ErrNotLeader = fmt.Errorf("node is not the leader")
 	// ErrLeadershipLost ...
 	ErrLeadershipLost = fmt.Errorf("leadership lost while committing log")
+	// ErrRaftShutdown raft is already shutdown
+	ErrRaftShutdown    = fmt.Errorf("raft is already shutdown")
 )
 
 type Raft struct {
@@ -201,6 +203,8 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 	select {
 	case <-timer:
 		return &DeferError{err: fmt.Errorf("timed out enqueuing operation")}
+	case <-r.shutdownCh:
+		return &DeferError{err: ErrRaftShutdown}
 	case r.applyCh <- deferLog:
 		return deferLog
 	}
@@ -216,8 +220,13 @@ func (r *Raft) AddPeer(peer net.Addr) ApplyDefer {
 		},
 		DeferError: DeferError{errCh: make(chan error, 1)},
 	}
-	r.applyCh <- deferLog
-	return deferLog
+	select{
+	case r.applyCh <- deferLog:
+		return deferLog
+	case <-r.shutdownCh:
+		return &DeferError{err: ErrRaftShutdown}
+	}
+
 }
 
 // RemovePeer is used to remove a peer from the cluster. If the
@@ -231,8 +240,12 @@ func (r *Raft) RemovePeer(peer net.Addr) ApplyDefer {
 		},
 		DeferError: DeferError{errCh: make(chan error, 1)},
 	}
-	r.applyCh <- logFuture
-	return logFuture
+	select {
+	case r.applyCh <- logFuture:
+		return logFuture
+	case <-r.shutdownCh:
+		return &DeferError{err: ErrRaftShutdown}
+	}
 }
 
 // appendEntries is invoked when we get an append entries RPC call
@@ -697,7 +710,7 @@ func (r *Raft) leaderProcessLog(s *leaderState, l *Log) bool {
 
 	// Step down if we are being removed
 	if l.Type == LogRemovePeer && isSelf {
-		r.setState(Follower)
+		r.logD.Printf("Removed ourself, stepping down as leader")
 		return true
 	}
 	return false
@@ -711,7 +724,10 @@ func (r *Raft) leaderNoop() {
 			Type: LogNoop,
 		},
 	}
-	r.applyCh <- logFuture
+	select {
+	case r.applyCh <- logFuture:
+	case <-r.shutdownCh:
+	}
 }
 
 // runFSM is a long running goroutine responsible for the management
@@ -784,6 +800,12 @@ func (r *Raft) processLog(l *Log) {
 		r.peerLock.Lock()
 		if peer.String() == r.localAddr.String() {
 			r.peers = nil
+			if r.conf.ShutdownOnRemove {
+				r.logD.Printf("Removed ourself, shutting down")
+				r.Shutdown()
+			} else {
+				r.setState(Follower)
+			}
 		} else {
 			r.peers = excludePeer(r.peers, peer)
 		}
@@ -806,6 +828,7 @@ func (r *Raft) Shutdown() {
 	if !r.shutdown {
 		close(r.shutdownCh)
 		r.shutdown = true
+		r.setState(Shutdown)
 	}
 }
 

@@ -3,6 +3,7 @@ package yaft
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"net"
 	"testing"
 	"time"
@@ -35,10 +36,11 @@ func TestRaft_StartStop(t *testing.T) {
 
 func inmemConfig() *Config {
 	return &Config{
-		HeartbeatTimeout: 5 * time.Millisecond,
+		HeartbeatTimeout: 10 * time.Millisecond,
 		ElectionTimeout:  10 * time.Millisecond,
 		CommitTimeout:    time.Millisecond,
 		MaxAppendEntries: 16,
+		ShutdownOnRemove: true,
 	}
 }
 
@@ -55,7 +57,7 @@ func TestRaft_SingleNode(t *testing.T) {
 	}
 	defer raft.Shutdown()
 
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(conf.HeartbeatTimeout * 4)
 
 	// Should be leader
 	if s := raft.State(); s != Leader {
@@ -79,6 +81,13 @@ type cluster struct {
 	fsms   []*MockFSM
 	trans  []*InmemTransport
 	rafts  []*Raft
+}
+
+func (c *cluster) Merge(other *cluster) {
+	c.stores = append(c.stores, other.stores...)
+	c.fsms = append(c.fsms, other.fsms...)
+	c.trans = append(c.trans, other.trans...)
+	c.rafts = append(c.rafts, other.rafts...)
 }
 
 func (c *cluster) Close() {
@@ -379,6 +388,59 @@ func TestRaft_ApplyConcurrent(t *testing.T) {
 
 	// Wait for replication
 	time.Sleep(50 * time.Millisecond)
+
+	// Check the FSMs
+	c.EnsureSame(t)
+}
+
+func TestRaft_JoinNode(t *testing.T) {
+	// Make a cluster
+	c := MakeCluster(2, t, nil)
+	defer c.Close()
+
+	// Apply a log to this cluster to ensure it is 'newer'
+	leader := c.Leader()
+	future := leader.Apply([]byte("first"), 0)
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	} else {
+		log.Printf("[INFO] Applied log")
+	}
+
+	// Make a new cluster of 1
+	c1 := MakeCluster(1, t, nil)
+
+	// Merge clusters
+	c.Merge(c1)
+	c.FullyConnect()
+
+	// Wait until we have 2 leaders
+	limit := time.Now().Add(100 * time.Millisecond)
+	var leaders []*Raft
+	for time.Now().Before(limit) && len(leaders) != 2 {
+		time.Sleep(10 * time.Millisecond)
+		leaders = c.GetState(Leader)
+	}
+	if len(leaders) != 2 {
+		t.Fatalf("expected two leader: %v", leaders)
+	}
+
+	// Join the new node in
+	future = leader.AddPeer(c1.rafts[0].localAddr)
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Wait until we have 2 followers
+	limit = time.Now().Add(100 * time.Millisecond)
+	var followers []*Raft
+	for time.Now().Before(limit) && len(followers) != 2 {
+		time.Sleep(10 * time.Millisecond)
+		followers = c.GetState(Follower)
+	}
+	if len(followers) != 2 {
+		t.Fatalf("expected two followers: %v", followers)
+	}
 
 	// Check the FSMs
 	c.EnsureSame(t)

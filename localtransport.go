@@ -128,7 +128,6 @@ func (i *InmemTransport) DecodePeer(buf []byte) net.Addr {
 	return &InmemAddr{string(buf)}
 }
 
-
 // Disconnect is used to remove the ability to route to a given peer
 func (i *InmemTransport) Disconnect(peer net.Addr) {
 	i.Lock()

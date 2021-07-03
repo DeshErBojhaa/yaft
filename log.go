@@ -20,7 +20,6 @@ const (
 
 	// LogRemovePeer used to remove an existing peer
 	LogRemovePeer
-
 )
 
 var ErrLogNotFound = errors.New("log not found")

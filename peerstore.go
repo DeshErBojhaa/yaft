@@ -31,4 +31,3 @@ func (s *DummyPeerStore) SetPeers(p []net.Addr) error {
 	s.StaticPeers = p
 	return nil
 }
-

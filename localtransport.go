@@ -118,6 +118,17 @@ func (i *InmemTransport) Connect(peer net.Addr, trans *InmemTransport) {
 	i.peers[peer.String()] = trans
 }
 
+// EncodePeer use the UUID as the address directly
+func (i *InmemTransport) EncodePeer(p net.Addr) []byte {
+	return []byte(p.String())
+}
+
+// DecodePeer wraps the UUID in an InmemAddr
+func (i *InmemTransport) DecodePeer(buf []byte) net.Addr {
+	return &InmemAddr{string(buf)}
+}
+
+
 // Disconnect is used to remove the ability to route to a given peer
 func (i *InmemTransport) Disconnect(peer net.Addr) {
 	i.Lock()

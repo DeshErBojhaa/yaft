@@ -72,7 +72,8 @@ type Raft struct {
 	logD *log.Logger
 
 	// peers ...
-	peers []net.Addr
+	peers    []net.Addr
+	peerLock sync.Mutex
 
 	// commitCh is used to provide the newest commit index
 	// so that changes can be applied to the FSM. This is used
@@ -113,12 +114,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 
 	// Construct the list of peers that excludes us
 	localAddr := trans.LocalAddr()
-	otherPeers := make([]net.Addr, 0, len(peers))
-	for _, p := range peers {
-		if p.String() != localAddr.String() {
-			otherPeers = append(otherPeers, p)
-		}
-	}
+	peers = excludePeer(peers, localAddr)
 
 	r := &Raft{
 		conf:       conf,
@@ -132,9 +128,9 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 		commitCh:   make(chan commitTuple, 128),
 		applyCh:    make(chan *DeferLog),
 		rpcCh:      trans.Consume(),
-		peers:      otherPeers,
+		peers:      peers,
 		trans:      trans,
-		localAddr: localAddr,
+		localAddr:  localAddr,
 	}
 	// Initialize as a follower
 	r.setState(Follower)
@@ -206,6 +202,36 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 		return deferLog
 	}
 }
+
+// AddPeer is used to add a new peer into the cluster. This must be
+// run on the leader or it will fail.
+func (r *Raft) AddPeer(peer net.Addr) ApplyDefer {
+	deferlog := &DeferLog{
+		log: Log{
+			Type: LogAddPeer,
+			Data: r.trans.EncodePeer(peer),
+		},
+		DeferError: DeferError{errCh: make(chan error, 1)},
+	}
+	r.applyCh <- deferlog
+	return deferlog
+}
+
+// RemovePeer is used to remove a peer from the cluster. If the
+// current leader is being removed, it will cause a new election
+// to occur. This must be run on the leader or it will fail.
+func (r *Raft) RemovePeer(peer net.Addr) ApplyDefer {
+	logFuture := &DeferLog{
+		log: Log{
+			Type: LogRemovePeer,
+			Data: r.trans.EncodePeer(peer),
+		},
+		DeferError: DeferError{errCh: make(chan error, 1)},
+	}
+	r.applyCh <- logFuture
+	return logFuture
+}
+
 
 // appendEntries is invoked when we get an append entries RPC call
 // Returns true if we transition to a Follower
@@ -373,6 +399,8 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 // the current term. The response channel returned is used to wait
 // for all the responses (including a vote for ourself).
 func (r *Raft) electSelf() <-chan *RequestVoteResponse {
+	r.peerLock.Lock()
+	defer r.peerLock.Unlock()
 	// Create a response channel
 	respCh := make(chan *RequestVoteResponse, len(r.peers)+1)
 
@@ -542,6 +570,7 @@ func (r *Raft) runLeader() {
 	defer close(stopCh)
 
 	// Create the trigger channels
+	r.peerLock.Lock()
 	triggers := make([]chan struct{}, 0, len(r.peers))
 	for i := 0; i < len(r.peers); i++ {
 		triggers = append(triggers, make(chan struct{}, 1))
@@ -551,6 +580,8 @@ func (r *Raft) runLeader() {
 	for i, peer := range r.peers {
 		go r.replicate(inflight, triggers[i], stopCh, peer)
 	}
+	r.peerLock.Unlock()
+
 	// seal leadership
 	go r.leaderNoop()
 
@@ -640,15 +671,10 @@ func (r *Raft) runFSM() {
 						panic(err)
 					}
 				}
-
-				// Only apply commands, ignore other logs
-				if l.Type == LogCommand {
-					r.fsm.Apply(l.Data)
-				}
-
-				// Update the lastApplied
-				r.setLastApplied(l.Index)
+				r.processLog(l)
 			}
+
+			r.setLastApplied(commitTuple.index)
 
 			// Invoke the future if given
 			if commitTuple.deferLog != nil {
@@ -662,6 +688,41 @@ func (r *Raft) runFSM() {
 		case <-r.shutdownCh:
 			return
 		}
+	}
+}
+
+// processLog is invoked to process the application of a single committed log
+func (r *Raft) processLog(l *Log) {
+	switch l.Type {
+	case LogCommand:
+		r.fsm.Apply(l.Data)
+
+	case LogAddPeer:
+		peer := r.trans.DecodePeer(l.Data)
+
+		// Avoid adding ourself as a peer
+		r.peerLock.Lock()
+		if peer.String() != r.localAddr.String() {
+			r.peers = addUniquePeer(r.peers, peer)
+		}
+		r.peerLock.Unlock()
+
+	case LogRemovePeer:
+		peer := r.trans.DecodePeer(l.Data)
+
+		// Removing ourself acts like removing all other peers
+		r.peerLock.Lock()
+		if peer.String() == r.localAddr.String() {
+			r.peers = nil
+		} else {
+			r.peers = excludePeer(r.peers, peer)
+		}
+		r.peerLock.Unlock()
+
+	case LogNoop:
+		// Ignore the no-op
+	default:
+		r.logE.Printf("Got unrecognized log type: %#v", l)
 	}
 }
 
@@ -871,11 +932,48 @@ func generateUUID() string {
 
 // asyncNotify is used to do an async channel send to
 // a list of channels. This will not block.
-func asyncNotify(chs []chan struct{}) {
-	for _, ch := range chs {
-		select {
-		case ch <- struct{}{}:
-		default:
+func asyncNotify(chans []chan struct{}) {
+	for _, ch := range chans {
+		asyncNotifyCh(ch)
+	}
+}
+
+// asyncNotifyCh is used to do an async channel send
+// to a single channel without blocking.
+func asyncNotifyCh(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// excludePeer is used to exclude a single peer from a list of peers
+func excludePeer(peers []net.Addr, peer net.Addr) []net.Addr {
+	otherPeers := make([]net.Addr, 0, len(peers))
+	for _, p := range peers {
+		if p.String() != peer.String() {
+			otherPeers = append(otherPeers, p)
 		}
+	}
+	return otherPeers
+}
+
+// peerExists checks if a given peer is contained in a list
+func peerExists(peers []net.Addr, peer net.Addr) bool {
+	for _, p := range peers {
+		if p.String() == peer.String() {
+			return true
+		}
+	}
+	return false
+}
+
+// addUniquePeer is used to add a peer to a list of existing
+// peers only if it is not already contained
+func addUniquePeer(peers []net.Addr, peer net.Addr) []net.Addr {
+	if peerExists(peers, peer) {
+		return peers
+	} else {
+		return append(peers, peer)
 	}
 }

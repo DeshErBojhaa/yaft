@@ -14,6 +14,13 @@ const (
 
 	// LogNoop is used to assert leadership
 	LogNoop
+
+	// LogAddPeer used to add a new peer
+	LogAddPeer
+
+	// LogRemovePeer used to remove an existing peer
+	LogRemovePeer
+
 )
 
 var ErrLogNotFound = errors.New("log not found")

@@ -49,7 +49,7 @@ type RequestVoteResponse struct {
 	Term uint64
 
 	// Return the peers, so that a node can shutdown on removal
-	Peers []byte
+	Peers [][]byte
 
 	// Is the vote granted
 	Granted bool

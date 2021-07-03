@@ -331,10 +331,17 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 // requestVote is called when node is in the follower state and
 // get an request vote for candidate.
 func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
+	r.peerLock.Lock()
+	defer r.peerLock.Unlock()
 	// Setup a response
+	peers := make([][]byte, 0, len(r.peers))
+	for _, p := range r.peers {
+		peers = append(peers, []byte(p.String()))
+	}
 	resp := &RequestVoteResponse{
 		Term:    r.getCurrentTerm(),
 		Granted: false,
+		Peers:   peers,
 	}
 	var err error
 	defer rpc.Respond(resp, err)

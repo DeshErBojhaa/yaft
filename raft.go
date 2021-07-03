@@ -211,6 +211,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 	// Setup a response
 	resp := &AppendEntriesResponse{
 		Term:    r.getCurrentTerm(),
+		LastLog: r.getLastLogIndex(),
 		Success: false,
 	}
 	var err error
@@ -688,6 +689,13 @@ func min(a, b uint64) uint64 {
 	return b
 }
 
+func max(a, b uint64) uint64 {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
 // persistVote is used to persist our vote for safety
 func (r *Raft) persistVote(term uint64, candidate []byte) error {
 	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
@@ -780,11 +788,10 @@ START:
 				indexes.nextIndex-1, err)
 			return
 		}
+	} else {
+		req.PrevLogEntry = 0
+		req.PrevLogTerm = 0
 	}
-
-	// Set the previous index and term (0 if nextIndex is 1)
-	req.PrevLogEntry = l.Index
-	req.PrevLogTerm = l.Term
 
 	// Append up to MaxAppendEntries or up to the lastIndex
 	req.Entries = make([]*Log, 0, 16)
@@ -820,7 +827,8 @@ START:
 		indexes.nextIndex = maxIndex + 1
 	} else {
 		r.logW.Printf("AppendEntries to %v rejected, sending older logs", peer)
-		indexes.nextIndex--
+		indexes.nextIndex = max(min(indexes.nextIndex-1, resp.LastLog+1), 1)
+
 		indexes.matchIndex = indexes.nextIndex - 1
 	}
 

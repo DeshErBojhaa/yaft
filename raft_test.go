@@ -2,6 +2,7 @@ package yaft
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -94,6 +95,22 @@ func (c *cluster) GetState(s RaftState) []*Raft {
 	return in
 }
 
+func (c *cluster) Leader() *Raft {
+	timeout := time.AfterFunc(100*time.Millisecond, func() {
+		panic("timeout waiting for leader")
+	})
+	defer timeout.Stop()
+
+	for len(c.GetState(Leader)) < 1 {
+		time.Sleep(time.Millisecond)
+	}
+	leaders := c.GetState(Leader)
+	if len(leaders) != 1 {
+		panic(fmt.Errorf("expected one leader: %v", leaders))
+	}
+	return leaders[0]
+}
+
 func (c *cluster) FullyConnect() {
 	for i, t1 := range c.trans {
 		for j, t2 := range c.trans {
@@ -115,6 +132,25 @@ func (c *cluster) Disconnect(a net.Addr) {
 	}
 }
 
+func (c *cluster) EnsureSame(t *testing.T) {
+	first := c.fsms[0]
+	for i, fsm := range c.fsms {
+		if i == 0 {
+			continue
+		}
+
+		if len(first.logs) != len(fsm.logs) {
+			t.Fatalf("length mismatch: %d %d",
+				len(first.logs), len(fsm.logs))
+		}
+
+		for idx := 0; idx < len(first.logs); idx++ {
+			if bytes.Compare(first.logs[idx], fsm.logs[idx]) != 0 {
+				t.Fatalf("log mismatch at index %d", idx)
+			}
+		}
+	}
+}
 
 func MakeCluster(n int, t *testing.T) *cluster {
 	c := &cluster{}
@@ -157,15 +193,7 @@ func TestRaft_TripleNode(t *testing.T) {
 	c := MakeCluster(3, t)
 	defer c.Close()
 
-	// Wait for elections
-	time.Sleep(15 * time.Millisecond)
-
-	// Should be one leader
-	leaders := c.GetState(Leader)
-	if len(leaders) != 1 {
-		t.Fatalf("expected one leader: %v", leaders)
-	}
-	leader := leaders[0]
+	leader := c.Leader()
 
 	// Should be able to apply
 	future := leader.Apply([]byte("test"), time.Millisecond)
@@ -189,15 +217,7 @@ func TestRaft_LeaderFail(t *testing.T) {
 	c := MakeCluster(3, t)
 	defer c.Close()
 
-	// Wait for elections
-	time.Sleep(15 * time.Millisecond)
-
-	// Should be one leader
-	leaders := c.GetState(Leader)
-	if len(leaders) != 1 {
-		t.Fatalf("expected one leader: %v", leaders)
-	}
-	leader := leaders[0]
+	leader := c.Leader()
 
 	// Should be able to apply
 	future := leader.Apply([]byte("test"), time.Millisecond)
@@ -212,10 +232,10 @@ func TestRaft_LeaderFail(t *testing.T) {
 	c.Disconnect(leader.localAddr)
 
 	// Wait for new leader
-	time.Sleep(15 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 
 	// Should be two leaders!
-	leaders = c.GetState(Leader)
+	leaders := c.GetState(Leader)
 	if len(leaders) != 2 {
 		t.Fatalf("expected two leader: %v", leaders)
 	}
@@ -263,5 +283,66 @@ func TestRaft_LeaderFail(t *testing.T) {
 		if bytes.Compare(fsm.logs[1], []byte("apply")) != 0 {
 			t.Fatalf("second entry should be 'apply'")
 		}
+	}
+}
+
+
+func TestRaft_BehindFollower(t *testing.T) {
+	// Make the cluster
+	c := MakeCluster(3, t)
+	defer c.Close()
+
+	// Disconnect one follower
+	followers := c.GetState(Follower)
+	behind := followers[0]
+	c.Disconnect(behind.localAddr)
+
+	// Commit a lot of things
+	leader := c.Leader()
+	var future ApplyDefer
+	for i := 0; i < 100; i++ {
+		future = leader.Apply([]byte(fmt.Sprintf("test%d", i)), 0)
+	}
+
+	// Wait for the last future to apply
+	if err := future.Error(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Reconnect the behind node
+	c.FullyConnect()
+
+	// Wait for replication
+	time.Sleep(100 * time.Millisecond)
+
+	// Ensure all the logs are the same
+	c.EnsureSame(t)
+}
+
+func TestRaft_ApplyNonLeader(t *testing.T) {
+	// Make the cluster
+	c := MakeCluster(5, t)
+	defer c.Close()
+
+	// Wait for a leader
+	c.Leader()
+
+	// Try to apply to them
+	followers := c.GetState(Follower)
+	if len(followers) != 4 {
+		t.Fatalf("Expected 4 followers")
+	}
+	follower := followers[0]
+
+	// Try to apply
+	future := follower.Apply([]byte("test"), time.Millisecond)
+
+	if future.Error() != ErrNotLeader {
+		t.Fatalf("should not apply on follower")
+	}
+
+	// Should be cached
+	if future.Error() != ErrNotLeader {
+		t.Fatalf("should not apply on follower")
 	}
 }

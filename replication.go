@@ -19,6 +19,7 @@ type followerReplication struct {
 // replicate is a long running routine that is used to manage
 // the process of replicating logs to our followers
 func (r *Raft) replicate(s *followerReplication) {
+	go r.heartbeat(s)
 	shouldStop := false
 	for !shouldStop {
 		select {
@@ -106,4 +107,26 @@ START:
 		goto START
 	}
 	return
+}
+
+// heartbeat is used to periodically invoke AppendEntries on a peer
+// to ensure they don't time out. This is done async of replicate(),
+// since that routine could potentially be blocked on disk IO
+func (r *Raft) heartbeat(s *followerReplication) {
+	for {
+		select {
+		case <-randomTimeout(r.conf.HeartbeatTimeout/4, r.conf.HeartbeatTimeout/2):
+			req := AppendEntriesRequest{
+				Term:              r.getCurrentTerm(),
+				Leader:            r.CandidateId(),
+				LeaderCommitIndex: r.getCommitIndex(),
+			}
+			var resp AppendEntriesResponse
+			if err := r.trans.AppendEntries(s.peer, &req, &resp); err != nil {
+				r.logE.Printf("Failed to heartbeat to %v: %v", s.peer, err)
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
 }

@@ -21,11 +21,12 @@ func (m *MockFSM) Apply(log []byte) {
 func TestRaft_StartStop(t *testing.T) {
 	_, trans := NewDummyTransport()
 	store := NewDummyStore()
+	peers := &DummyPeerStore{}
 
 	fsm := &MockFSM{}
 	conf := DefaultConfig()
 
-	raft, err := NewRaft(conf, store, store, nil, fsm, trans)
+	raft, err := NewRaft(conf, store, store, peers, fsm, trans)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -45,9 +46,10 @@ func TestRaft_SingleNode(t *testing.T) {
 	conf := inmemConfig()
 	_, trans := NewDummyTransport()
 	store := NewDummyStore()
+	peerStore := &DummyPeerStore{}
 	fsm := &MockFSM{}
 
-	raft, err := NewRaft(conf, store, store, nil, fsm, trans)
+	raft, err := NewRaft(conf, store, store, peerStore, fsm, trans)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -178,9 +180,10 @@ func MakeCluster(n int, t *testing.T, conf *Config) *cluster {
 		store := c.stores[i]
 		trans := c.trans[i]
 		fsm := c.fsms[i]
+		peerStore := &DummyPeerStore{peers}
 
 		// Start raft
-		raft, err := NewRaft(conf, store, store, peers, fsm, trans)
+		raft, err := NewRaft(conf, store, store, peerStore, fsm, trans)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}

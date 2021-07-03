@@ -72,8 +72,9 @@ type Raft struct {
 	logD *log.Logger
 
 	// peers ...
-	peers    []net.Addr
-	peerLock sync.Mutex
+	peers     []net.Addr
+	peerLock  sync.Mutex
+	peerStore PeerStore
 
 	// commitCh is used to provide the newest commit index
 	// so that changes can be applied to the FSM. This is used
@@ -100,20 +101,24 @@ type commitTuple struct {
 }
 
 // NewRaft is used to construct a new Raft node
-func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM, trans Transport) (*Raft, error) {
+func NewRaft(conf *Config, store Store, logs LogStore, peerStore PeerStore, fsm FSM, trans Transport) (*Raft, error) {
 	// Try to restore the current term
 	currentTerm, err := store.GetUint64(keyCurrentTerm)
 	if err != nil && errors.Is(err, ErrNotFound) {
-		return nil, fmt.Errorf("failed to load current term: %v", err)
+		return nil, fmt.Errorf("failed to load current term: %w", err)
 	}
 
 	lastLog, err := logs.LastIndex()
 	if err != nil {
-		return nil, fmt.Errorf("failed to find last log: %v", err)
+		return nil, fmt.Errorf("failed to find last log: %w", err)
 	}
 
 	// Construct the list of peers that excludes us
 	localAddr := trans.LocalAddr()
+	peers, err := peerStore.Peers()
+	if err != nil {
+		return nil, fmt.Errorf("peer store failed: %w", err)
+	}
 	peers = excludePeer(peers, localAddr)
 
 	r := &Raft{
@@ -129,6 +134,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 		applyCh:    make(chan *DeferLog),
 		rpcCh:      trans.Consume(),
 		peers:      peers,
+		peerStore:  peerStore,
 		trans:      trans,
 		localAddr:  localAddr,
 	}
@@ -232,7 +238,6 @@ func (r *Raft) RemovePeer(peer net.Addr) ApplyDefer {
 	return logFuture
 }
 
-
 // appendEntries is invoked when we get an append entries RPC call
 // Returns true if we transition to a Follower
 func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool) {
@@ -284,14 +289,14 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) (transition bool)
 			r.logW.Printf("Clearing log suffix from %d to %d",
 				entry.Index, r.getLastLogIndex())
 			if err := r.logs.DeleteRange(entry.Index, r.getLastLogIndex()); err != nil {
-				r.logE.Printf("Failed to clear log suffix: %v", err)
+				r.logE.Printf("Failed to clear log suffix: %w", err)
 				return
 			}
 		}
 
 		// Append the entry
 		if err := r.logs.StoreLog(entry); err != nil {
-			r.logE.Printf("Failed to append to log: %v", err)
+			r.logE.Printf("Failed to append to log: %w", err)
 			return
 		}
 
@@ -333,7 +338,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 	// Increase the term if we see a newer one
 	if req.Term > r.getCurrentTerm() {
 		if err := r.setCurrentTerm(req.Term); err != nil {
-			r.logE.Printf("Failed to update current term: %v", err)
+			r.logE.Printf("Failed to update current term: %w", err)
 			return
 		}
 		resp.Term = req.Term
@@ -346,12 +351,12 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 	// Check if we have voted yet
 	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
 	if err != nil && err.Error() != "not found" {
-		r.logE.Printf("raft: Failed to get last vote term: %v", err)
+		r.logE.Printf("raft: Failed to get last vote term: %w", err)
 		return
 	}
 	lastVoteCandyBytes, err := r.stable.Get(keyLastVoteCand)
 	if err != nil && err.Error() != "not found" {
-		r.logE.Printf("raft: Failed to get last vote candidate: %v", err)
+		r.logE.Printf("raft: Failed to get last vote candidate: %w", err)
 		return
 	}
 
@@ -386,7 +391,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) (transition bool) {
 
 	// Persist a vote for safety
 	if err := r.persistVote(req.Term, req.Candidate); err != nil {
-		r.logE.Printf("raft: Failed to persist vote: %v", err)
+		r.logE.Printf("raft: Failed to persist vote: %w", err)
 		return
 	}
 
@@ -416,7 +421,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 
 	// Increment the term
 	if err := r.setCurrentTerm(r.getCurrentTerm() + 1); err != nil {
-		r.logE.Printf("Failed to update current term: %v", err)
+		r.logE.Printf("Failed to update current term: %w", err)
 		return nil
 	}
 
@@ -450,7 +455,7 @@ func (r *Raft) electSelf() <-chan *RequestVoteResponse {
 
 	// Persist a vote for ourselves
 	if err := r.persistVote(req.Term, req.Candidate); err != nil {
-		r.logE.Printf("Failed to persist vote : %v", err)
+		r.logE.Printf("Failed to persist vote : %w", err)
 		return nil
 	}
 
@@ -523,7 +528,7 @@ func (r *Raft) runCandidate() {
 				r.logD.Printf("Newer term discovered")
 				r.setState(Follower)
 				if err := r.setCurrentTerm(vote.Term); err != nil {
-					r.logE.Printf("Failed to update current term: %v", err)
+					r.logE.Printf("Failed to update current term: %w", err)
 				}
 				return
 			}
@@ -594,7 +599,7 @@ func (r *Raft) runLeader() {
 			applyLog.log.Term = r.getCurrentTerm()
 			// Write the log entry locally
 			if err := r.logs.StoreLog(&applyLog.log); err != nil {
-				r.logE.Printf("Failed to commit log: %v", err)
+				r.logE.Printf("Failed to commit log: %w", err)
 				applyLog.response = err
 				applyLog.Response()
 				r.setState(Follower)
@@ -788,19 +793,19 @@ func (r *Raft) CandidateId() []byte {
 	if errors.Is(err, ErrNotFound) {
 		id := generateUUID()
 		if err := r.stable.Set(keyCandidateId, []byte(id)); err != nil {
-			panic(fmt.Errorf("failed to write CandidateId: %v", err))
+			panic(fmt.Errorf("failed to write CandidateId: %w", err))
 		}
 		r.candidateIdCache = []byte(id)
 		return []byte(id)
 	}
-	panic(fmt.Errorf("failed to read CandidateId: %v", err))
+	panic(fmt.Errorf("failed to read CandidateId: %w", err))
 }
 
 // setCurrentTerm is used to set the current term in a durable manner
 func (r *Raft) setCurrentTerm(t uint64) error {
 	// Make persistence
 	if err := r.stable.SetUint64(keyCurrentTerm, t); err != nil {
-		r.logE.Printf("Failed to save current term: %v", err)
+		r.logE.Printf("Failed to save current term: %w", err)
 		return err
 	}
 	r.raftState.setCurrentTerm(t)
@@ -919,7 +924,7 @@ func (r *Raft) quorumSize() int {
 func generateUUID() string {
 	buf := make([]byte, 16)
 	if _, err := cr.Read(buf); err != nil {
-		panic(fmt.Errorf("failed to read random bytes: %v", err))
+		panic(fmt.Errorf("failed to read random bytes: %w", err))
 	}
 
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%12x",

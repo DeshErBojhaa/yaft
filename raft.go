@@ -88,6 +88,7 @@ type Raft struct {
 	// Stores our local addr
 	localAddr net.Addr
 
+	candidateIdCache []byte
 }
 
 // commitTupel is used to send an index that was committed,
@@ -141,6 +142,7 @@ func NewRaft(conf *Config, store Store, logs LogStore, peers []net.Addr, fsm FSM
 	// Restore the current term and the last log
 	_ = r.setCurrentTerm(currentTerm)
 	r.setLastLogIndex(lastLog)
+	r.CandidateId()
 
 	go r.run()
 	go r.runFSM()
@@ -709,9 +711,15 @@ func (r *Raft) persistVote(term uint64, candidate []byte) error {
 
 // CandidateId is used to return a stable and unique candidate ID
 func (r *Raft) CandidateId() []byte {
+	// Check cache
+	if r.candidateIdCache != nil {
+		return r.candidateIdCache
+	}
+
 	// Get the persistent id
 	raw, err := r.stable.Get(keyCandidateId)
 	if err == nil {
+		r.candidateIdCache = raw
 		return raw
 	}
 
@@ -721,6 +729,7 @@ func (r *Raft) CandidateId() []byte {
 		if err := r.stable.Set(keyCandidateId, []byte(id)); err != nil {
 			panic(fmt.Errorf("failed to write CandidateId: %v", err))
 		}
+		r.candidateIdCache = []byte(id)
 		return []byte(id)
 	}
 	panic(fmt.Errorf("failed to read CandidateId: %v", err))

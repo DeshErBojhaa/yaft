@@ -48,6 +48,7 @@ func TestInflight_Cancel(t *testing.T) {
 		log:        Log{Index: 1},
 		DeferError: DeferError{errCh: make(chan error)},
 	}
+
 	in.Start(l, 3)
 
 	// Cancel with an error

@@ -41,6 +41,7 @@ type Raft struct {
 	// FSM is a finite state machine handler for logs
 	fsm FSM
 
+	shutdown bool
 	// shutdownCh is to signal the system wide shutdown
 	shutdownCh chan struct{}
 
@@ -160,6 +161,11 @@ func (r *Raft) run() {
 			r.runLeader()
 		}
 	}
+}
+
+// State is used to return the state of current node
+func (r *Raft) State() RaftState {
+	return r.getState()
 }
 
 // Apply is used to apply a command to the FSM in a highly consistent
@@ -492,7 +498,7 @@ func (r *Raft) runCandidate() {
 			}
 		case a := <-r.applyCh:
 			// Reject any operations since we are not the leader
-			a.response = ErrNotLeader // TODO: Fix
+			a.response = ErrNotLeader
 			a.Response()
 
 		case <-electionTimeout:
@@ -646,11 +652,11 @@ func (r *Raft) runFSM() {
 // This is not a graceful operation.
 func (r *Raft) Shutdown() {
 	r.shutdownLock.Lock()
-	defer r.shutdownLock.Lock()
+	defer r.shutdownLock.Unlock()
 
-	if r.shutdownCh != nil {
+	if !r.shutdown {
 		close(r.shutdownCh)
-		r.shutdownCh = nil
+		r.shutdown = true
 	}
 }
 

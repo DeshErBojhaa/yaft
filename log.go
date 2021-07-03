@@ -1,6 +1,9 @@
 package yaft
 
-import "net"
+import (
+	"errors"
+	"net"
+)
 
 // LogType describes various types of log entries.
 type LogType uint8
@@ -12,6 +15,8 @@ const (
 	// LogNoop is used to assert leadership
 	LogNoop
 )
+
+var ErrLogNotFound = errors.New("log not found")
 
 // Log entries are replicated to all members of the Raft cluster
 // and form the heart of the replicated state machine.

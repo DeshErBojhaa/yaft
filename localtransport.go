@@ -34,9 +34,9 @@ type InmemTransport struct {
 	peers      map[string]*InmemTransport
 }
 
-// NewInmemTransport is used to initialize a new transport
+// NewDummyTransport is used to initialize a new transport
 // and generates a random local address.
-func NewInmemTransport() (*InmemAddr, *InmemTransport) {
+func NewDummyTransport() (*InmemAddr, *InmemTransport) {
 	addr := NewInmemAddr()
 	trans := &InmemTransport{
 		consumerCh: make(chan RPC, 16),

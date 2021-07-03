@@ -2,6 +2,7 @@ package yaft
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -522,4 +523,33 @@ func TestRaft_RemoveLeader(t *testing.T) {
 	if leader.State() != Shutdown {
 		t.Fatalf("leader should be shutdown")
 	}
+}
+
+func TestRaft_AfterShutdown(t *testing.T) {
+	store := NewDummyStore()
+
+	_, trans := NewDummyTransport()
+	fsm := &MockFSM{}
+	conf := DefaultConfig()
+	peers := &DummyPeerStore{}
+
+	raft, err := NewRaft(conf, store, store, peers, fsm, trans)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	raft.Shutdown()
+
+	// Everything should fail now
+	if f := raft.Apply(nil, 0); !errors.Is(f.Error(), ErrRaftShutdown) {
+		t.Fatalf("should be shutdown: %v", f.Error())
+	}
+	if f := raft.AddPeer(NewInmemAddr()); !errors.Is(f.Error(), ErrRaftShutdown) {
+		t.Fatalf("should be shutdown: %v", f.Error())
+	}
+	if f := raft.RemovePeer(NewInmemAddr()); !errors.Is(f.Error(), ErrRaftShutdown) {
+		t.Fatalf("should be shutdown: %v", f.Error())
+	}
+
+	// Should be idempotent
+	raft.Shutdown()
 }

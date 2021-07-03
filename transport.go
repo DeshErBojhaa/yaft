@@ -5,6 +5,7 @@ import "net"
 // RPC has a command, and provides a Reponse mechanism
 type RPC struct {
 	// Type assert to determine the type
+	Peer net.Addr
 	Command  interface{}
 	RespChan chan<- RPCResponse
 }

@@ -562,38 +562,37 @@ func (r *Raft) runCandidate() {
 	}
 }
 
+type leaderState struct {
+	commitCh  chan *DeferLog
+	inflight  *inflight
+	replicationState map[string]*followerReplication
+}
+
+func (l *leaderState) Release() {
+	// Stop replication
+	for _, p := range l.replicationState {
+		close(p.stopCh)
+	}
+
+	// Cancel inflight requests
+	l.inflight.Cancel(ErrLeadershipLost)
+}
+
 // runLeader runs the FSM for a leader
 func (r *Raft) runLeader() {
-	// Make a channel to processes commits, defer cancellation
-	// of all inflight processes when we step down
-	commitCh := make(chan *DeferLog, 128)
-	inflight := NewInflight(commitCh)
-	defer inflight.Cancel(ErrLeadershipLost)
+	state := leaderState{
+		commitCh:  make(chan *DeferLog, 128),
+		replicationState: make(map[string]*followerReplication),
+	}
+	defer state.Release()
 
-	// Track the replication state of our peers
-	replicateState := make(map[string]*followerReplication)
-	// Defer closing all replicators
-	defer func() {
-		for _, p := range replicateState {
-			close(p.stopCh)
-		}
-	}()
-	lastLogIndex := r.getLastLogIndex()
-	// Create the trigger channels
+	// Initialize inflight tracker
+	state.inflight = NewInflight(state.commitCh)
+
 	r.peerLock.Lock()
-
 	// Start a replication routine for each peer
 	for _, peer := range r.peers {
-		state := &followerReplication{
-			peer:       peer,
-			inflight:   inflight,
-			stopCh:     make(chan struct{}),
-			triggerCh:  make(chan struct{}, 1),
-			matchIndex: lastLogIndex,
-			nextIndex:  lastLogIndex + 1,
-		}
-		replicateState[peer.String()] = state
-		go r.replicate(state)
+		r.startReplication(&state, peer)
 	}
 	r.peerLock.Unlock()
 
@@ -617,20 +616,24 @@ func (r *Raft) runLeader() {
 			}
 
 			// Add this to the inflight logs
-			inflight.Start(applyLog, r.quorumSize())
-			inflight.Commit(applyLog.log.Index)
+			state.inflight.Start(applyLog, r.quorumSize())
+			state.inflight.Commit(applyLog.log.Index)
 			// Update the last log since it's on disk now
 			r.setLastLogIndex(applyLog.log.Index)
 
 			// Notify the replicators of the new log
-			for _, f := range replicateState {
+			for _, f := range state.replicationState {
 				asyncNotifyCh(f.triggerCh)
 			}
 
-		case commitLog := <-commitCh:
+		case commitLog := <-state.commitCh:
 			// Increment the commit index
 			idx := commitLog.log.Index
 			r.setCommitIndex(idx)
+
+			// Perform leader-specific processing
+			transition = r.leaderProcessLog(&state, &commitLog.log)
+
 			// Trigger applying logs locally
 			r.commitCh <- commitTuple{idx, commitLog}
 
@@ -649,6 +652,58 @@ func (r *Raft) runLeader() {
 			return
 		}
 	}
+}
+
+// startReplication is a helper to setup state and start async replication to a peer
+func (r *Raft) startReplication(state *leaderState, peer net.Addr) {
+	s := &followerReplication{
+		peer:       peer,
+		inflight:   state.inflight,
+		stopCh:     make(chan struct{}),
+		triggerCh:  make(chan struct{}, 1),
+		matchIndex: r.getLastLogIndex(),
+		nextIndex:  r.getLastLogIndex() + 1,
+	}
+	state.replicationState[peer.String()] = s
+	go r.replicate(s)
+}
+
+// leaderProcessLog is used for leader-specific log handling before we
+// hand off to the generic runPostCommit handler. Returns true if there
+// should be a state transition.
+func (r *Raft) leaderProcessLog(s *leaderState, l *Log) bool {
+	// Only handle LogAddPeer and LogRemove Peer
+	if l.Type != LogAddPeer && l.Type != LogRemovePeer {
+		return false
+	}
+
+	// Process the log immediately to update the peer list
+	r.processLog(l)
+
+	// Decode the peer
+	peer := r.trans.DecodePeer(l.Data)
+	isSelf := peer.String() == r.localAddr.String()
+
+	// Get the replication state
+	repl, ok := s.replicationState[peer.String()]
+
+	// Start replication for new nodes
+	if l.Type == LogAddPeer && !ok && !isSelf {
+		r.startReplication(s, peer)
+	}
+
+	// Stop replication for old nodes
+	if l.Type == LogRemovePeer && ok {
+		close(repl.stopCh)
+		delete(s.replicationState, peer.String())
+	}
+
+	// Step down if we are being removed
+	if l.Type == LogRemovePeer && isSelf {
+		r.setState(Follower)
+		return true
+	}
+	return false
 }
 
 // leaderNoop is a blocking command that appends a no-op log

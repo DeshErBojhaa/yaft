@@ -26,6 +26,8 @@ var (
 	ErrLeadershipLost = fmt.Errorf("leadership lost while committing log")
 	// ErrRaftShutdown raft is already shutdown
 	ErrRaftShutdown    = fmt.Errorf("raft is already shutdown")
+	// ErrEnqueueTimeout is timeout for log
+	ErrEnqueueTimeout  = fmt.Errorf("timed out enqueuing operation")
 )
 
 type Raft struct {
@@ -202,7 +204,7 @@ func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyDefer {
 
 	select {
 	case <-timer:
-		return &DeferError{err: fmt.Errorf("timed out enqueuing operation")}
+		return &DeferError{err: ErrEnqueueTimeout}
 	case <-r.shutdownCh:
 		return &DeferError{err: ErrRaftShutdown}
 	case r.applyCh <- deferLog:
@@ -797,7 +799,7 @@ func (r *Raft) processLog(l *Log) {
 		if peer.String() != r.localAddr.String() {
 			r.peers = addUniquePeer(r.peers, peer)
 		}
-		_ = r.peerStore.SetPeers(r.peers)
+		_ = r.peerStore.SetPeers(append([]net.Addr{r.localAddr}, r.peers...))
 		r.peerLock.Unlock()
 
 	case LogRemovePeer:
@@ -816,7 +818,7 @@ func (r *Raft) processLog(l *Log) {
 		} else {
 			r.peers = excludePeer(r.peers, peer)
 		}
-		_ = r.peerStore.SetPeers(r.peers)
+		_ = r.peerStore.SetPeers(append([]net.Addr{r.localAddr}, r.peers...))
 		r.peerLock.Unlock()
 
 	case LogNoop:
